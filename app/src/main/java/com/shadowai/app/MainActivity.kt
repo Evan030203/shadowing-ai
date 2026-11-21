@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -43,6 +44,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -54,6 +56,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private lateinit var hear: Hear
@@ -131,6 +134,29 @@ private fun openFile(ctx: Context, lib: Library, uri: Uri): VideoItem {
     return lib.open("file:$uri", fileTitle(ctx, uri), "file", uri.toString())
 }
 
+/** 지금 쓰는 모델 파일이 어디에 있고 얼마나 큰지. */
+private fun describeModel(): String {
+    val f = Llm.modelFile ?: return ""
+    val where = when {
+        ModelFiles.isPrivate(f) -> "이 앱 안"
+        f.parentFile?.name == "LocalAI" -> "공용 폴더 Download/LocalAI"
+        else -> "공용 폴더 Download"
+    }
+    return "모델 파일: " + where + " · %.2fGB".format(f.length() / 1e9)
+}
+
+/** '모든 파일에 대한 접근'을 켜는 설정 화면을 연다. */
+private fun openAccessSettings(ctx: Context) {
+    try {
+        ctx.startActivity(ModelFiles.accessIntent(ctx))
+    } catch (_: Exception) {
+        try {
+            ctx.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        } catch (_: Exception) {
+        }
+    }
+}
+
 @Composable
 fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: Int) {
     val ctx = LocalContext.current
@@ -147,6 +173,11 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
     var aiNote by remember { mutableStateOf("") }
     var aiProgress by remember { mutableStateOf(0f) }
     var aiRetry by remember { mutableIntStateOf(0) }
+    var access by remember { mutableStateOf(ModelFiles.hasAccess()) }
+    var modelWhere by remember { mutableStateOf("") }
+    var moving by remember { mutableStateOf(false) }
+    var moveNote by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
 
     // AI 모델이 올라와 있는 동안에는 앱이 뒤로 가도 꺼지지 않게 붙잡아 둔다.
     LaunchedEffect(ai) { if (ai == AiStatus.READY) KeepAlive.start(ctx) }
@@ -166,24 +197,17 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
         }
     }
 
-    // 모델 다운로드와 로딩을 1초마다 살핀다.
+    // 모델 파일 찾기, 다운로드, 로딩을 1초마다 살핀다.
     LaunchedEffect(aiRetry) {
         while (true) {
+            access = ModelFiles.hasAccess()
             if (Llm.isLoaded) {
                 ai = AiStatus.READY
+                modelWhere = describeModel()
                 break
             }
             val id = store.downloadId
-            if (store.modelDone && ModelFiles.file(ctx).exists()) {
-                ai = AiStatus.LOADING
-                if (Llm.load(ctx, store)) {
-                    ai = AiStatus.READY
-                } else {
-                    ai = AiStatus.ERROR
-                    aiNote = "모델을 불러오지 못했어요: ${Llm.lastError}"
-                }
-                break
-            } else if (id != -1L) {
+            if (id != -1L) {
                 val p = ModelFiles.query(ctx, id)
                 when {
                     p == null -> {
@@ -191,10 +215,7 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
                         ai = AiStatus.NONE
                         aiNote = "다운로드가 취소됐어요."
                     }
-                    p.status == DownloadManager.STATUS_SUCCESSFUL -> {
-                        store.modelDone = true
-                        store.downloadId = -1L
-                    }
+                    p.status == DownloadManager.STATUS_SUCCESSFUL -> store.downloadId = -1L
                     p.status == DownloadManager.STATUS_FAILED -> {
                         ModelFiles.cancel(ctx, id)
                         store.downloadId = -1L
@@ -212,7 +233,19 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
                     }
                 }
             } else {
-                store.modelDone = false
+                // 공용 폴더에 모델이 있으면 그것을, 없으면 예전에 앱 안에 받아 둔 것을 쓴다.
+                val file = ModelFiles.find(ctx)
+                if (file != null) {
+                    ai = AiStatus.LOADING
+                    if (Llm.load(ctx, store, file)) {
+                        ai = AiStatus.READY
+                        modelWhere = describeModel()
+                    } else {
+                        ai = AiStatus.ERROR
+                        aiNote = "모델을 불러오지 못했어요: ${Llm.lastError}"
+                    }
+                    break
+                }
                 ai = AiStatus.NONE
             }
             delay(1000)
@@ -252,11 +285,43 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
                 aiNote = aiNote,
                 aiProgress = aiProgress,
                 note = note,
+                access = access,
+                modelWhere = modelWhere,
+                modelIsPrivate = modelWhere.isNotEmpty() && Llm.modelFile?.let { ModelFiles.isPrivate(it) } == true,
+                moving = moving,
+                moveNote = moveNote,
+                onGrantAccess = { openAccessSettings(ctx) },
+                onMove = {
+                    if (!ModelFiles.hasAccess()) {
+                        // 공용 폴더에 쓰려면 먼저 허용이 필요하다. 허용하고 돌아와 다시 누르면 옮긴다.
+                        openAccessSettings(ctx)
+                    } else {
+                        moveNote = ""
+                        moving = true
+                        scope.launch {
+                            val moved = ModelFiles.moveToShared(ctx)
+                            moving = false
+                            if (moved != null) {
+                                Llm.movedTo(moved)
+                                modelWhere = describeModel()
+                            } else {
+                                moveNote = "옮기지 못했어요. 저장 공간이 3GB 이상 비어 있는지 확인하고 다시 눌러 주세요."
+                            }
+                        }
+                    }
+                },
                 onDownload = {
-                    aiNote = ""
-                    store.modelDone = false
-                    store.downloadId = ModelFiles.start(ctx)
-                    aiRetry++
+                    if (!ModelFiles.hasAccess()) {
+                        openAccessSettings(ctx)
+                    } else {
+                        aiNote = ""
+                        try {
+                            store.downloadId = ModelFiles.start(ctx)
+                        } catch (_: Exception) {
+                            aiNote = "다운로드를 시작하지 못했어요."
+                        }
+                        aiRetry++
+                    }
                 },
                 onCancelDownload = {
                     ModelFiles.cancel(ctx, store.downloadId)
@@ -284,6 +349,13 @@ private fun Home(
     aiNote: String,
     aiProgress: Float,
     note: String,
+    access: Boolean,
+    modelWhere: String,
+    modelIsPrivate: Boolean,
+    moving: Boolean,
+    moveNote: String,
+    onGrantAccess: () -> Unit,
+    onMove: () -> Unit,
     onDownload: () -> Unit,
     onCancelDownload: () -> Unit,
     onRetryLoad: () -> Unit,
@@ -304,9 +376,15 @@ private fun Home(
             Text("로컬 AI", fontWeight = FontWeight.Bold)
             when (ai) {
                 AiStatus.NONE -> {
-                    Text("AI 모델(Gemma 4 E2B, 약 2.6GB)을 받아야 영상 분석과 발음 분석을 쓸 수 있어요. 한 번 받으면 인터넷 없이 폰 안에서만 돌아요.")
+                    Text("AI 모델은 이 앱 안이 아니라 폰의 공용 폴더(Download/LocalAI)에 한 번만 둬요. 이 앱은 그 파일을 읽기만 해서, 앱을 지워도 모델은 남아요.")
                     if (aiNote.isNotEmpty()) Text(aiNote, color = Bad)
-                    Button(onClick = onDownload) { Text("AI 모델 받기 (와이파이)") }
+                    if (!access) {
+                        Text("먼저 이 앱이 공용 폴더의 파일을 읽을 수 있게 허용해 주세요. 설정 화면에서 '모든 파일에 대한 접근 허용'을 켜면 돼요.")
+                        Button(onClick = onGrantAccess) { Text("파일 접근 허용하기") }
+                    } else {
+                        Text("공용 폴더에서 모델 파일(.litertlm)을 찾지 못했어요. 아래 버튼으로 한 번 받거나, 이미 받아 둔 파일을 Download 폴더에 넣어 주세요.")
+                        Button(onClick = onDownload) { Text("AI 모델 받기 (와이파이, 2.6GB)") }
+                    }
                 }
 
                 AiStatus.DOWNLOADING -> {
@@ -322,10 +400,24 @@ private fun Home(
                     Text("AI를 깨우는 중이에요… (처음엔 1분쯤 걸릴 수 있어요)")
                 }
 
-                AiStatus.READY -> Text(
-                    "준비됐어요 · ${Llm.backendName}로 실행 중 · " +
-                        if (Llm.hasAudio) "소리 듣기 가능" else "소리 듣기 불가(영상·발음 분석이 제한돼요)"
-                )
+                AiStatus.READY -> {
+                    Text(
+                        "준비됐어요 · ${Llm.backendName}로 실행 중 · " +
+                            if (Llm.hasAudio) "소리 듣기 가능" else "소리 듣기 불가(영상·발음 분석이 제한돼요)"
+                    )
+                    if (modelWhere.isNotEmpty()) Text(modelWhere)
+                    if (moveNote.isNotEmpty()) Text(moveNote, color = Bad)
+                    if (moving) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.width(22.dp).height(22.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Text("모델을 공용 폴더로 옮기는 중이에요…")
+                        }
+                    } else if (modelIsPrivate) {
+                        Text("지금은 모델이 이 앱 안에 있어서, 앱을 지우면 모델도 같이 지워져요. 공용 폴더로 옮기면 앱을 지워도 남고 다시 받지 않아도 돼요.")
+                        Button(onClick = onMove) { Text("모델을 공용 폴더로 옮기기") }
+                    }
+                }
 
                 AiStatus.ERROR -> {
                     Text(aiNote, color = Bad)
