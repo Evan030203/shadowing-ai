@@ -91,6 +91,12 @@ class Library(ctx: Context) {
                         val c = cs.getJSONObject(j)
                         item.clips.add(Clip(c.getDouble("s"), c.getDouble("e"), c.getString("t")))
                     }
+                    // 예전 버전에서 분석한 영상은 한 구간에 여러 문장이 묶여 있으므로 한 문장씩 다시 나눈다.
+                    if (!o.optBoolean("ss", false) && item.clips.isNotEmpty()) {
+                        val split = Sentences.fromLines(item.clips.map { Line(it.start, it.end, it.text) })
+                        item.clips.clear()
+                        item.clips.addAll(split.map { Clip(it.start, it.end, it.text) })
+                    }
                     items.add(item)
                 }
             }
@@ -108,7 +114,7 @@ class Library(ctx: Context) {
                 }
                 arr.put(
                     JSONObject().put("key", item.key).put("title", item.title).put("kind", item.kind)
-                        .put("src", item.src).put("to", item.analyzedTo).put("done", item.done).put("dl", item.downloadId).put("clips", cs)
+                        .put("src", item.src).put("to", item.analyzedTo).put("done", item.done).put("dl", item.downloadId).put("ss", true).put("clips", cs)
                 )
             }
             file.writeText(arr.toString())
@@ -370,7 +376,7 @@ object Analyzer {
         if (t.isEmpty() || t.uppercase().startsWith("NONE")) return false
         val letters = t.count { it in 'a'..'z' || it in 'A'..'Z' }
         val words = t.split(Regex("\\s+")).size
-        return words >= 3 && letters * 2 >= t.length
+        return words >= 2 && letters * 2 >= t.length
     }
 
     /** 공부에 쓸 만한 영어 문장만 남긴다. 영어가 아닌 것, 노래, 의미 없는 조각은 버린다. */
@@ -405,6 +411,7 @@ object Analyzer {
                     try {
                         val seg = Segmenter(reader.positionSec)
                         val batch = mutableListOf<Clip>()
+                        val builder = SentenceBuilder(padBefore = 0.05, padAfter = 0.1)
                         var lastNote = -10.0
 
                         suspend fun flush(upTo: Double) {
@@ -429,7 +436,10 @@ object Analyzer {
                                 } catch (_: Exception) {
                                     ""
                                 }
-                                if (usable(text)) batch.add(Clip(piece.start, piece.end, text.trim()))
+                                // 조각을 한 문장씩 나눠 담는다.
+                                for (c in builder.add(piece.start, piece.end, piece.pcm, text)) {
+                                    if (usable(c.text)) batch.add(c)
+                                }
                                 if (batch.size >= 8) flush(piece.end)
                             }
                             if (abs(seg.timeSec - lastNote) >= 5) {
@@ -439,6 +449,7 @@ object Analyzer {
                                 withContext(Dispatchers.Main) { note = "AI가 영상을 듣고 있어요 · $now$all" }
                             }
                         }
+                        for (c in builder.finish()) if (usable(c.text)) batch.add(c)
                         flush(seg.timeSec)
                         withContext(Dispatchers.Main) {
                             item.done = true
@@ -502,6 +513,8 @@ object Analyzer {
         job = scope.launch {
             try {
                 val batch = mutableListOf<Clip>()
+                // 마이크로 들을 때는 영상과 시간이 조금 어긋날 수 있어 앞뒤 여유를 더 둔다.
+                val builder = SentenceBuilder(padBefore = 0.3, padAfter = 0.3)
 
                 suspend fun flush() {
                     if (batch.isEmpty()) return
@@ -521,13 +534,15 @@ object Analyzer {
                     } catch (_: Exception) {
                         ""
                     }
-                    val start = (p.start + offset - 0.3).coerceAtLeast(0.0)
-                    val end = p.end + offset + 0.3
-                    if (usable(text) && end > start) batch.add(Clip(start, end, text.trim()))
+                    // 조각을 한 문장씩 나눠 담는다.
+                    for (c in builder.add(p.start + offset, p.end + offset, p.pcm, text)) {
+                        if (usable(c.text) && c.end > 0.5) batch.add(c)
+                    }
                     note = "영상을 재생하며 AI가 듣고 있어요 · ${clock(player.positionSec)}" +
                         if (player.durationSec > 0) " / ${clock(player.durationSec)}" else ""
                     if (batch.size >= 6) flush()
                 }
+                for (c in builder.finish()) if (usable(c.text) && c.end > 0.5) batch.add(c)
                 flush()
                 if (reachedEnd) {
                     item.done = true
@@ -557,7 +572,7 @@ object Analyzer {
         note = "AI가 스크립트를 분석하고 있어요…"
         job = scope.launch {
             try {
-                val merged = mergeLines(lines).map { Clip(it.start, it.end, it.text) }
+                val merged = Sentences.fromLines(lines).map { Clip(it.start, it.end, it.text) }
                 item.clips.clear()
                 item.done = false
                 for (group in merged.chunked(15)) {
@@ -579,27 +594,6 @@ object Analyzer {
         }
     }
 
-    /** 자막의 짧은 줄들을 문장이 끝나는 곳이나 8초 안팎에서 합친다. */
-    private fun mergeLines(lines: List<Line>): List<Line> {
-        val out = mutableListOf<Line>()
-        var start = 0.0
-        var end = 0.0
-        val sb = StringBuilder()
-        for (l in lines) {
-            if (sb.isEmpty()) start = l.start
-            if (sb.isNotEmpty()) sb.append(' ')
-            sb.append(l.text)
-            end = l.end
-            val t = sb.toString()
-            val closed = t.endsWith(".") || t.endsWith("?") || t.endsWith("!")
-            if ((closed && end - start >= 2.0) || end - start >= 8.0 || t.split(' ').size >= 18) {
-                out.add(Line(start, end, t))
-                sb.setLength(0)
-            }
-        }
-        if (sb.isNotEmpty()) out.add(Line(start, end, sb.toString()))
-        return out
-    }
 }
 
 fun clock(sec: Double): String {

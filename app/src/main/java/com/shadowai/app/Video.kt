@@ -879,6 +879,23 @@ fun VideoScreen(
                     }
                 }
                 if (!Analyzer.running && Analyzer.note.isNotEmpty()) Text(Analyzer.note, color = Bad)
+                if (!Analyzer.running && !noVideo && canHear && (item.clips.isNotEmpty() || item.done)) {
+                    TextButton(onClick = {
+                        Analyzer.stop()
+                        resetLine()
+                        item.clips.clear()
+                        item.analyzedTo = 0.0
+                        item.done = false
+                        lib.save()
+                        if (!item.isYouTube) {
+                            Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib)
+                        } else if (micGranted()) {
+                            startListeningAnalysis()
+                        } else {
+                            askMicForAnalysis.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    }) { Text("처음부터 다시 분석하기") }
+                }
             }
         }
 
