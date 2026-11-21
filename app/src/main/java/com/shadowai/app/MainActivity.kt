@@ -2,7 +2,9 @@ package com.shadowai.app
 
 import android.Manifest
 import android.app.DownloadManager
+import android.content.Intent
 import android.content.pm.PackageManager
+import androidx.compose.runtime.MutableState
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -61,24 +63,41 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private lateinit var speaker: Speaker
-    private lateinit var listener: Listener
+    private lateinit var hear: Hear
+    private val recorder = Recorder()
+
+    /** 유튜브 앱의 공유 버튼으로 넘어온 글(영상 주소). */
+    private val shared = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         speaker = Speaker(this)
-        listener = Listener(this)
+        hear = Hear(Listener(this), recorder)
+        takeShared(intent)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 Surface(Modifier.fillMaxSize()) {
-                    App(speaker, listener)
+                    App(speaker, hear, recorder, shared)
                 }
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        takeShared(intent)
+    }
+
+    private fun takeShared(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_SEND) {
+            intent.getStringExtra(Intent.EXTRA_TEXT)?.let { shared.value = it }
+        }
+    }
+
     override fun onDestroy() {
-        listener.cancel()
+        hear.cancel()
+        recorder.stop()
         speaker.shutdown()
         super.onDestroy()
     }
@@ -91,12 +110,28 @@ private val Good = Color(0xFF1B8A4B)
 private val Bad = Color(0xFFD23B3B)
 
 @Composable
-fun App(speaker: Speaker, listener: Listener) {
+fun App(speaker: Speaker, hear: Hear, recorder: Recorder, shared: MutableState<String?>) {
     val ctx = LocalContext.current
     val store = remember { Store(ctx) }
     val scope = rememberCoroutineScope()
 
     var screen by remember { mutableStateOf(if (store.level == 0) "onboard" else "home") }
+    var video by remember { mutableStateOf<VideoSource?>(null) }
+    var shareNote by remember { mutableStateOf("") }
+
+    // 유튜브 앱에서 공유한 영상을 바로 연다.
+    LaunchedEffect(shared.value) {
+        val text = shared.value ?: return@LaunchedEffect
+        shared.value = null
+        val id = youTubeId(text)
+        if (id == null) {
+            shareNote = "공유된 내용에서 유튜브 영상 주소를 찾지 못했어요."
+        } else {
+            shareNote = ""
+            video = VideoSource.YouTube(id)
+            screen = "video"
+        }
+    }
     var level by remember { mutableIntStateOf(store.level) }
     var sentences by remember { mutableStateOf(listOf<Sentence>()) }
     var fromAi by remember { mutableStateOf(false) }
@@ -215,7 +250,22 @@ fun App(speaker: Speaker, listener: Listener) {
                     aiRetry++
                 },
                 onStart = { startRound() },
+                shareNote = shareNote,
+                onVideo = {
+                    video = it
+                    screen = "video"
+                },
             )
+
+            "video" -> video?.let { v ->
+                VideoPractice(
+                    source = v,
+                    aiReady = ai == AiStatus.READY,
+                    hear = hear,
+                    recorder = recorder,
+                    onExit = { screen = if (level == 0) "onboard" else "home" },
+                )
+            }
 
             "loading" -> Column(
                 Modifier
@@ -238,7 +288,7 @@ fun App(speaker: Speaker, listener: Listener) {
                 simultaneous = store.simultaneous,
                 aiReady = ai == AiStatus.READY,
                 speaker = speaker,
-                listener = listener,
+                hear = hear,
                 store = store,
                 onFinish = { r ->
                     results = r
@@ -291,7 +341,15 @@ private fun Home(
     onCancelDownload: () -> Unit,
     onRetryLoad: () -> Unit,
     onStart: () -> Unit,
+    shareNote: String,
+    onVideo: (VideoSource) -> Unit,
 ) {
+    val ctx = LocalContext.current
+    var link by remember { mutableStateOf("") }
+    var linkNote by remember { mutableStateOf("") }
+    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) onVideo(VideoSource.LocalFile(uri))
+    }
     var topic by remember { mutableStateOf(store.topic) }
     var simultaneous by remember { mutableStateOf(store.simultaneous) }
     val weak = remember { store.topWeak(6) }
@@ -376,6 +434,39 @@ private fun Home(
     Button(onClick = onStart, modifier = Modifier.fillMaxWidth().height(56.dp)) {
         Text("연습 시작 (${Coach.ROUND}문장)", fontSize = 18.sp)
     }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("영상으로 쉐도잉", fontWeight = FontWeight.Bold)
+            Text("유튜브 앱에서 공유 → 쉐도잉 AI를 고르거나, 영상 주소를 붙여 넣으세요.")
+            OutlinedTextField(
+                value = link,
+                onValueChange = { link = it },
+                label = { Text("유튜브 영상 주소") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            val note = linkNote.ifEmpty { shareNote }
+            if (note.isNotEmpty()) Text(note, color = Bad)
+            Button(
+                onClick = {
+                    val id = youTubeId(link)
+                    if (id == null) {
+                        linkNote = "유튜브 영상 주소가 아니에요."
+                    } else {
+                        linkNote = ""
+                        onVideo(VideoSource.YouTube(id))
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("유튜브 영상 열기") }
+            Text("폰에 저장된 내 영상·음성 파일은 인터넷 없이 연습할 수 있어요.")
+            OutlinedButton(
+                onClick = { pickFile.launch(arrayOf("video/*", "audio/*")) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("내 파일로 연습 (오프라인)") }
+        }
+    }
 }
 
 @Composable
@@ -386,7 +477,7 @@ private fun Practice(
     simultaneous: Boolean,
     aiReady: Boolean,
     speaker: Speaker,
-    listener: Listener,
+    hear: Hear,
     store: Store,
     onFinish: (List<Int>) -> Unit,
 ) {
@@ -408,7 +499,7 @@ private fun Practice(
 
     fun stopAll() {
         speaker.stop()
-        listener.cancel()
+        hear.cancel()
     }
 
     fun scored(text: String) {
@@ -436,7 +527,7 @@ private fun Practice(
     fun listen() {
         phase = "listening"
         heard = ""
-        listener.start(
+        hear.start(
             onPartial = { heard = it },
             onResult = { scored(it) },
             fail = {
@@ -526,7 +617,7 @@ private fun Practice(
         "listening" -> {
             Text(if (simultaneous) "음성에 맞춰 따라 말하세요" else "이제 따라 말하세요", fontSize = 18.sp, fontWeight = FontWeight.Bold)
             if (heard.isNotEmpty()) Text(heard)
-            OutlinedButton(onClick = { listener.finishSpeaking() }) { Text("다 말했어요") }
+            OutlinedButton(onClick = { hear.finishSpeaking() }) { Text("다 말했어요") }
         }
     }
 

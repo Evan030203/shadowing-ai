@@ -4,6 +4,8 @@ import android.app.DownloadManager
 import android.content.Context
 import android.net.Uri
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -62,6 +64,10 @@ object Llm {
         private set
     var lastError: String = ""
         private set
+
+    /** 모델이 소리 입력을 받을 수 있게 올라갔는지. */
+    var hasAudio: Boolean = false
+        private set
     val isLoaded: Boolean get() = engine != null
 
     suspend fun load(ctx: Context, store: Store): Boolean = withContext(thread) {
@@ -69,32 +75,49 @@ object Llm {
         val path = ModelFiles.file(ctx).absolutePath
         val cache = ctx.cacheDir.path
 
-        if (!store.gpuCrashed) {
-            store.gpuCrashed = true
-            try {
-                val e = Engine(EngineConfig(modelPath = path, backend = Backend.GPU(), cacheDir = cache))
-                e.initialize()
-                engine = e
-                backendName = "GPU"
-            } catch (t: Throwable) {
-                lastError = t.message ?: t.toString()
+        // 소리를 알아듣는 기능까지 켜서 올려 보고, 안 되면 글자 전용으로 올린다.
+        fun open(gpu: Boolean, audio: Boolean): Boolean = try {
+            val main = if (gpu) Backend.GPU() else Backend.CPU()
+            val config = if (audio) {
+                EngineConfig(modelPath = path, backend = main, audioBackend = Backend.CPU(), cacheDir = cache)
+            } else {
+                EngineConfig(modelPath = path, backend = main, cacheDir = cache)
             }
-            if (engine != null) {
-                store.gpuCrashed = false
-                return@withContext true
-            }
-        }
-
-        try {
-            val e = Engine(EngineConfig(modelPath = path, backend = Backend.CPU(), cacheDir = cache))
+            val e = Engine(config)
             e.initialize()
             engine = e
-            backendName = "CPU"
+            backendName = if (gpu) "GPU" else "CPU"
+            hasAudio = audio
             true
         } catch (t: Throwable) {
             lastError = t.message ?: t.toString()
             false
         }
+
+        if (!store.gpuCrashed) {
+            store.gpuCrashed = true
+            val ok = open(gpu = true, audio = true) || open(gpu = true, audio = false)
+            if (ok) {
+                store.gpuCrashed = false
+                return@withContext true
+            }
+        }
+        open(gpu = false, audio = true) || open(gpu = false, audio = false)
+    }
+
+    /** 녹음한 영어 음성(WAV)을 폰 안에서 받아쓴다. */
+    suspend fun transcribe(wav: ByteArray): String = withContext(thread) {
+        val e = engine ?: throw IllegalStateException("AI 모델이 아직 준비되지 않았어요.")
+        if (!hasAudio) throw IllegalStateException("이 모델은 소리를 듣지 못해요.")
+        val answer = e.createConversation().use {
+            it.sendMessage(
+                Contents.of(
+                    Content.AudioBytes(wav),
+                    Content.Text("Transcribe the English speech in this audio word for word. Output only the transcript, with no notes or quotation marks."),
+                )
+            ).toString()
+        }
+        answer.trim().trim('"')
     }
 
     /** 질문 하나에 답 하나. 앞선 대화는 기억하지 않는다. */

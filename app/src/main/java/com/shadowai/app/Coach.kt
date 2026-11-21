@@ -56,6 +56,14 @@ object Coach {
         append("Be encouraging. Plain text only, no lists, no headings.")
     }
 
+    fun explainPrompt(sentence: String): String = buildString {
+        appendLine("A Korean learner is shadowing this English sentence from a video:")
+        appendLine(sentence)
+        appendLine("Answer in Korean, plain text, at most three short lines:")
+        appendLine("1) the natural Korean translation")
+        append("2) one useful expression from the sentence and how it is used")
+    }
+
     fun adaptPrompt(level: Int, results: List<Int>, weak: List<String>): String = buildString {
         appendLine("You set the difficulty of an English shadowing app. Levels go from 1 (easiest) to 10 (hardest).")
         appendLine("Current level: $level")
