@@ -1,13 +1,11 @@
 package com.shadowai.app
 
-import android.Manifest
 import android.app.DownloadManager
+import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import androidx.compose.runtime.MutableState
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -33,52 +31,45 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private lateinit var speaker: Speaker
     private lateinit var hear: Hear
     private val recorder = Recorder()
 
-    /** 유튜브 앱의 공유 버튼으로 넘어온 글(영상 주소). */
-    private val shared = mutableStateOf<String?>(null)
+    /** 다른 앱의 공유 버튼으로 넘어온 것: 유튜브 주소(글) 또는 영상 파일. */
+    private val shared = mutableStateOf<Any?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        speaker = Speaker(this)
         hear = Hear(Listener(this), recorder)
         takeShared(intent)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 Surface(Modifier.fillMaxSize()) {
-                    App(speaker, hear, recorder, shared)
+                    App(hear, recorder, shared)
                 }
             }
         }
@@ -90,15 +81,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun takeShared(intent: Intent?) {
-        if (intent?.action == Intent.ACTION_SEND) {
-            intent.getStringExtra(Intent.EXTRA_TEXT)?.let { shared.value = it }
-        }
+        if (intent?.action != Intent.ACTION_SEND) return
+        @Suppress("DEPRECATION")
+        val stream: Uri? = intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        if (stream != null) shared.value = stream else intent.getStringExtra(Intent.EXTRA_TEXT)?.let { shared.value = it }
     }
 
     override fun onDestroy() {
         hear.cancel()
         recorder.stop()
-        speaker.shutdown()
         super.onDestroy()
     }
 }
@@ -106,41 +97,54 @@ class MainActivity : ComponentActivity() {
 /** 로컬 AI 모델의 현재 상태. */
 enum class AiStatus { NONE, DOWNLOADING, LOADING, READY, ERROR }
 
-private val Good = Color(0xFF1B8A4B)
 private val Bad = Color(0xFFD23B3B)
 
+/** 주소나 파일을 영상 목록에 넣는다. 유튜브 주소가 아니면 영상 파일 주소로 본다. */
+private fun openLink(lib: Library, text: String): VideoItem? {
+    val id = youTubeId(text)
+    if (id != null) return lib.open("yt:$id", "유튜브 영상", "yt", id)
+    val url = Regex("https?://\\S+").find(text)?.value ?: return null
+    if (url.contains("youtube.com") || url.contains("youtu.be")) return null
+    return lib.open("file:$url", Uri.parse(url).lastPathSegment ?: "영상", "file", url)
+}
+
+private fun openFile(ctx: Context, lib: Library, uri: Uri): VideoItem {
+    // 앱을 다시 켜도 이 파일을 읽을 수 있게 권한을 유지한다(공유로 받은 파일은 안 될 수 있다).
+    try {
+        ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    } catch (_: Exception) {
+    }
+    return lib.open("file:$uri", fileTitle(ctx, uri), "file", uri.toString())
+}
+
 @Composable
-fun App(speaker: Speaker, hear: Hear, recorder: Recorder, shared: MutableState<String?>) {
+fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>) {
     val ctx = LocalContext.current
     val store = remember { Store(ctx) }
-    val scope = rememberCoroutineScope()
+    val lib = remember { Library(ctx) }
 
-    var screen by remember { mutableStateOf(if (store.level == 0) "onboard" else "home") }
-    var video by remember { mutableStateOf<VideoSource?>(null) }
-    var shareNote by remember { mutableStateOf("") }
-
-    // 유튜브 앱에서 공유한 영상을 바로 연다.
-    LaunchedEffect(shared.value) {
-        val text = shared.value ?: return@LaunchedEffect
-        shared.value = null
-        val id = youTubeId(text)
-        if (id == null) {
-            shareNote = "공유된 내용에서 유튜브 영상 주소를 찾지 못했어요."
-        } else {
-            shareNote = ""
-            video = VideoSource.YouTube(id)
-            screen = "video"
-        }
-    }
-    var level by remember { mutableIntStateOf(store.level) }
-    var sentences by remember { mutableStateOf(listOf<Sentence>()) }
-    var fromAi by remember { mutableStateOf(false) }
-    var results by remember { mutableStateOf(listOf<Int>()) }
+    var current by remember { mutableStateOf<VideoItem?>(null) }
+    var note by remember { mutableStateOf("") }
 
     var ai by remember { mutableStateOf(AiStatus.NONE) }
     var aiNote by remember { mutableStateOf("") }
     var aiProgress by remember { mutableStateOf(0f) }
     var aiRetry by remember { mutableIntStateOf(0) }
+
+    // 다른 앱에서 공유한 영상을 바로 연다.
+    LaunchedEffect(shared.value) {
+        val got = shared.value ?: return@LaunchedEffect
+        shared.value = null
+        val item = when (got) {
+            is Uri -> openFile(ctx, lib, got)
+            is String -> openLink(lib, got)
+            else -> null
+        }
+        if (item == null) note = "공유된 내용에서 영상을 찾지 못했어요." else {
+            note = ""
+            current = item
+        }
+    }
 
     // 모델 다운로드와 로딩을 1초마다 살핀다.
     LaunchedEffect(aiRetry) {
@@ -195,23 +199,6 @@ fun App(speaker: Speaker, hear: Hear, recorder: Recorder, shared: MutableState<S
         }
     }
 
-    fun startRound() {
-        screen = "loading"
-        scope.launch {
-            var list = emptyList<Sentence>()
-            if (ai == AiStatus.READY) {
-                try {
-                    val raw = Llm.ask(Coach.sentencesPrompt(store.topic, level, store.topWeak(4)))
-                    list = Coach.parseSentences(raw)
-                } catch (_: Exception) {
-                }
-            }
-            fromAi = list.size >= 3
-            sentences = if (fromAi) list else Coach.starter(level)
-            screen = "practice"
-        }
-    }
-
     Column(
         Modifier
             .fillMaxSize()
@@ -220,19 +207,26 @@ fun App(speaker: Speaker, hear: Hear, recorder: Recorder, shared: MutableState<S
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        when (screen) {
-            "onboard" -> Onboard { chosen ->
-                store.level = chosen
-                level = chosen
-                screen = "home"
+        val item = current
+        if (item != null) {
+            key(item.key) {
+                VideoScreen(
+                    item = item,
+                    lib = lib,
+                    store = store,
+                    aiReady = ai == AiStatus.READY,
+                    hear = hear,
+                    recorder = recorder,
+                    onExit = { current = null },
+                )
             }
-
-            "home" -> Home(
-                store = store,
-                level = level,
+        } else {
+            Home(
+                lib = lib,
                 ai = ai,
                 aiNote = aiNote,
                 aiProgress = aiProgress,
+                note = note,
                 onDownload = {
                     aiNote = ""
                     store.modelDone = false
@@ -249,129 +243,43 @@ fun App(speaker: Speaker, hear: Hear, recorder: Recorder, shared: MutableState<S
                     aiNote = ""
                     aiRetry++
                 },
-                onStart = { startRound() },
-                shareNote = shareNote,
-                onVideo = {
-                    video = it
-                    screen = "video"
+                onOpen = {
+                    note = ""
+                    current = it
                 },
             )
-
-            "video" -> video?.let { v ->
-                VideoPractice(
-                    source = v,
-                    aiReady = ai == AiStatus.READY,
-                    hear = hear,
-                    recorder = recorder,
-                    onExit = { screen = if (level == 0) "onboard" else "home" },
-                )
-            }
-
-            "loading" -> Column(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(top = 120.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                CircularProgressIndicator()
-                Text(
-                    if (ai == AiStatus.READY) "AI가 레벨 ${level}에 맞는 문장을 만들고 있어요…"
-                    else "문장을 준비하고 있어요…"
-                )
-            }
-
-            "practice" -> Practice(
-                sentences = sentences,
-                fromAi = fromAi,
-                level = level,
-                simultaneous = store.simultaneous,
-                aiReady = ai == AiStatus.READY,
-                speaker = speaker,
-                hear = hear,
-                store = store,
-                onFinish = { r ->
-                    results = r
-                    screen = if (r.isEmpty()) "home" else "result"
-                },
-            )
-
-            "result" -> Result(
-                results = results,
-                level = level,
-                aiReady = ai == AiStatus.READY,
-                store = store,
-                onLevel = { level = it },
-                onNext = { startRound() },
-                onHome = { screen = "home" },
-            )
-        }
-    }
-}
-
-@Composable
-private fun Onboard(onChoose: (Int) -> Unit) {
-    Spacer(Modifier.height(24.dp))
-    Text("쉐도잉 AI", fontSize = 30.sp, fontWeight = FontWeight.Bold)
-    Text("처음 시작할 난이도를 골라 주세요. 그다음부터는 AI가 따라 말한 결과를 보고 스스로 조절해요.")
-    Spacer(Modifier.height(8.dp))
-    LevelChoice("초급", "짧고 쉬운 일상 문장, 느린 속도") { onChoose(2) }
-    LevelChoice("중급", "자연스러운 대화 문장, 보통 속도") { onChoose(5) }
-    LevelChoice("고급", "긴 문장과 빠른 원어민 속도") { onChoose(8) }
-}
-
-@Composable
-private fun LevelChoice(title: String, desc: String, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(18.dp)) {
-            Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text(desc)
         }
     }
 }
 
 @Composable
 private fun Home(
-    store: Store,
-    level: Int,
+    lib: Library,
     ai: AiStatus,
     aiNote: String,
     aiProgress: Float,
+    note: String,
     onDownload: () -> Unit,
     onCancelDownload: () -> Unit,
     onRetryLoad: () -> Unit,
-    onStart: () -> Unit,
-    shareNote: String,
-    onVideo: (VideoSource) -> Unit,
+    onOpen: (VideoItem) -> Unit,
 ) {
     val ctx = LocalContext.current
     var link by remember { mutableStateOf("") }
     var linkNote by remember { mutableStateOf("") }
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) onVideo(VideoSource.LocalFile(uri))
+        if (uri != null) onOpen(openFile(ctx, lib, uri))
     }
-    var topic by remember { mutableStateOf(store.topic) }
-    var simultaneous by remember { mutableStateOf(store.simultaneous) }
-    val weak = remember { store.topWeak(6) }
 
     Text("쉐도잉 AI", fontSize = 30.sp, fontWeight = FontWeight.Bold)
-
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("레벨 $level / 10 · ${Coach.levelName(level)}", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            LinearProgressIndicator(progress = { level / 10f }, modifier = Modifier.fillMaxWidth())
-            if (store.lastReason.isNotEmpty()) Text(store.lastReason)
-            Text("지금까지 따라 말한 문장: ${store.totalSentences}개")
-            if (weak.isNotEmpty()) Text("자주 놓치는 단어: ${weak.joinToString(", ")}")
-        }
-    }
+    Text("좋아하는 영상을 넣으면 AI가 영어 대화 장면을 골라 주고, 따라 말한 내 발음을 분석해요.")
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("로컬 AI", fontWeight = FontWeight.Bold)
             when (ai) {
                 AiStatus.NONE -> {
-                    Text("AI 모델(Gemma 4 E2B, 약 2.6GB)을 받으면 내 관심사와 약점에 맞춘 문장, 발음 코칭, 자동 난이도 조절을 인터넷 없이 쓸 수 있어요. 받기 전에는 기본 문장으로 연습해요.")
+                    Text("AI 모델(Gemma 4 E2B, 약 2.6GB)을 받아야 영상 분석과 발음 분석을 쓸 수 있어요. 한 번 받으면 인터넷 없이 폰 안에서만 돌아요.")
                     if (aiNote.isNotEmpty()) Text(aiNote, color = Bad)
                     Button(onClick = onDownload) { Text("AI 모델 받기 (와이파이)") }
                 }
@@ -389,7 +297,10 @@ private fun Home(
                     Text("AI를 깨우는 중이에요… (처음엔 1분쯤 걸릴 수 있어요)")
                 }
 
-                AiStatus.READY -> Text("준비됐어요 · ${Llm.backendName}로 실행 중 · 인터넷 없이 동작해요")
+                AiStatus.READY -> Text(
+                    "준비됐어요 · ${Llm.backendName}로 실행 중 · " +
+                        if (Llm.hasAudio) "소리 듣기 가능" else "소리 듣기 불가(영상·발음 분석이 제한돼요)"
+                )
 
                 AiStatus.ERROR -> {
                     Text(aiNote, color = Bad)
@@ -402,334 +313,58 @@ private fun Home(
         }
     }
 
-    OutlinedTextField(
-        value = topic,
-        onValueChange = {
-            topic = it
-            store.topic = it
-        },
-        label = { Text("연습하고 싶은 주제 (AI가 이 주제로 문장을 만들어요)") },
-        singleLine = true,
-        enabled = ai == AiStatus.READY,
-        modifier = Modifier.fillMaxWidth(),
-    )
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text("동시 쉐도잉", fontWeight = FontWeight.Bold)
-            Text(
-                if (simultaneous) "음성과 동시에 따라 말해요. 이어폰을 꼭 껴 주세요."
-                else "문장을 끝까지 들은 다음 따라 말해요."
-            )
-        }
-        Switch(
-            checked = simultaneous,
-            onCheckedChange = {
-                simultaneous = it
-                store.simultaneous = it
-            },
-        )
-    }
-
-    Button(onClick = onStart, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-        Text("연습 시작 (${Coach.ROUND}문장)", fontSize = 18.sp)
-    }
-
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("영상으로 쉐도잉", fontWeight = FontWeight.Bold)
-            Text("유튜브 앱에서 공유 → 쉐도잉 AI를 고르거나, 영상 주소를 붙여 넣으세요.")
+            Text("영상 넣기", fontWeight = FontWeight.Bold)
+            Button(
+                onClick = { pickFile.launch(arrayOf("video/*", "audio/*")) },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+            ) { Text("폰에 있는 영상 고르기") }
+            Text("폰에 있는 영상은 AI가 소리를 직접 읽어 미리 분석하고, 인터넷 없이 연습할 수 있어요.")
             OutlinedTextField(
                 value = link,
                 onValueChange = { link = it },
-                label = { Text("유튜브 영상 주소") },
+                label = { Text("유튜브 주소 또는 영상 파일 주소") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            val note = linkNote.ifEmpty { shareNote }
-            if (note.isNotEmpty()) Text(note, color = Bad)
-            Button(
+            val shown = linkNote.ifEmpty { note }
+            if (shown.isNotEmpty()) Text(shown, color = Bad)
+            OutlinedButton(
                 onClick = {
-                    val id = youTubeId(link)
-                    if (id == null) {
-                        linkNote = "유튜브 영상 주소가 아니에요."
+                    val item = openLink(lib, link)
+                    if (item == null) {
+                        linkNote = "영상 주소를 찾지 못했어요."
                     } else {
                         linkNote = ""
-                        onVideo(VideoSource.YouTube(id))
+                        link = ""
+                        onOpen(item)
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("유튜브 영상 열기") }
-            Text("폰에 저장된 내 영상·음성 파일은 인터넷 없이 연습할 수 있어요.")
-            OutlinedButton(
-                onClick = { pickFile.launch(arrayOf("video/*", "audio/*")) },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("내 파일로 연습 (오프라인)") }
-        }
-    }
-}
-
-@Composable
-private fun Practice(
-    sentences: List<Sentence>,
-    fromAi: Boolean,
-    level: Int,
-    simultaneous: Boolean,
-    aiReady: Boolean,
-    speaker: Speaker,
-    hear: Hear,
-    store: Store,
-    onFinish: (List<Int>) -> Unit,
-) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val results = remember { mutableStateListOf<Int>() }
-
-    var idx by remember { mutableIntStateOf(0) }
-    var phase by remember { mutableStateOf("idle") } // idle, speaking, listening, scored
-    var heard by remember { mutableStateOf("") }
-    var score by remember { mutableStateOf<Score?>(null) }
-    var best by remember { mutableIntStateOf(-1) }
-    var tip by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
-    var showKo by remember { mutableStateOf(false) }
-
-    val s = sentences[idx]
-    val rate = Coach.speechRate(level)
-
-    fun stopAll() {
-        speaker.stop()
-        hear.cancel()
-    }
-
-    fun scored(text: String) {
-        val sc = scoreShadow(s.en, text)
-        score = sc
-        heard = text
-        phase = "scored"
-        if (sc.accuracy > best) best = sc.accuracy
-        store.record(sc)
-        tip = ""
-        if (aiReady && sc.missed.isNotEmpty()) {
-            val at = idx
-            tip = "…"
-            scope.launch {
-                val answer = try {
-                    Llm.ask(Coach.feedbackPrompt(s.en, text, sc.missed)).replace("*", "").trim()
-                } catch (_: Exception) {
-                    ""
-                }
-                if (idx == at) tip = answer
-            }
+            ) { Text("주소로 열기") }
+            Text("유튜브 앱이나 갤러리의 공유 버튼에서 '쉐도잉 AI'를 골라도 돼요.")
         }
     }
 
-    fun listen() {
-        phase = "listening"
-        heard = ""
-        hear.start(
-            onPartial = { heard = it },
-            onResult = { scored(it) },
-            fail = {
-                error = it
-                phase = "idle"
-                speaker.stop()
-            },
-        )
-    }
-
-    fun begin() {
-        error = ""
-        score = null
-        tip = ""
-        if (simultaneous) {
-            listen()
-            speaker.speak(s.en, rate) {}
-        } else {
-            phase = "speaking"
-            speaker.speak(s.en, rate) { if (phase == "speaking") listen() }
-        }
-    }
-
-    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) begin() else error = "마이크 권한을 허용해야 따라 말한 걸 들을 수 있어요."
-    }
-
-    fun beginWithPermission() {
-        if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) begin()
-        else askMic.launch(Manifest.permission.RECORD_AUDIO)
-    }
-
-    fun next() {
-        stopAll()
-        if (best >= 0) results.add(best)
-        if (idx + 1 >= sentences.size) {
-            onFinish(results.toList())
-        } else {
-            idx += 1
-            phase = "idle"
-            heard = ""
-            score = null
-            best = -1
-            tip = ""
-            error = ""
-            showKo = false
-        }
-    }
-
-    BackHandler {
-        stopAll()
-        onFinish(emptyList())
-    }
-    DisposableEffect(Unit) { onDispose { stopAll() } }
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("${idx + 1} / ${sentences.size}", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-        Text(if (fromAi) "AI가 만든 문장 · 레벨 $level" else "기본 문장 · 레벨 $level")
-    }
-    LinearProgressIndicator(progress = { (idx + 1f) / sentences.size }, modifier = Modifier.fillMaxWidth())
-
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            val sc = score
-            Text(
-                buildAnnotatedString {
-                    if (sc == null) {
-                        append(s.en)
-                    } else {
-                        sc.words.forEachIndexed { i, w ->
-                            if (i > 0) append(" ")
-                            withStyle(SpanStyle(color = if (w.ok) Good else Bad, fontWeight = FontWeight.Bold)) {
-                                append(w.word)
+    if (lib.items.isNotEmpty()) {
+        Text("내 영상", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        for (item in lib.items.toList()) {
+            Card(onClick = { onOpen(item) }, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(item.title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            (if (item.isYouTube) "유튜브" else "내 파일") + " · " + when {
+                                item.clips.isNotEmpty() && item.done -> "문장 ${item.clips.size}개 분석 완료"
+                                item.clips.isNotEmpty() -> "문장 ${item.clips.size}개 · ${clock(item.analyzedTo)}까지 분석"
+                                else -> "분석 전"
                             }
-                        }
+                        )
                     }
-                },
-                fontSize = 24.sp,
-                lineHeight = 34.sp,
-            )
-            if (showKo) Text(s.ko) else TextButton(onClick = { showKo = true }) { Text("뜻 보기") }
-        }
-    }
-
-    when (phase) {
-        "speaking" -> Text("잘 들어 보세요…", fontSize = 18.sp)
-        "listening" -> {
-            Text(if (simultaneous) "음성에 맞춰 따라 말하세요" else "이제 따라 말하세요", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            if (heard.isNotEmpty()) Text(heard)
-            OutlinedButton(onClick = { hear.finishSpeaking() }) { Text("다 말했어요") }
-        }
-    }
-
-    score?.let { sc ->
-        Text("정확도 ${sc.accuracy}%", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = if (sc.accuracy >= 75) Good else Bad)
-        Text("들린 말: $heard")
-        if (tip.isNotEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("AI 코치", fontWeight = FontWeight.Bold)
-                    Text(if (tip == "…") "발음을 분석하고 있어요…" else tip)
+                    TextButton(onClick = { lib.remove(item) }) { Text("삭제") }
                 }
             }
         }
-    }
-
-    if (error.isNotEmpty()) Text(error, color = Bad)
-
-    if (phase == "idle" || phase == "scored") {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { speaker.speak(s.en, rate) {} }, modifier = Modifier.weight(1f)) {
-                Text("듣기만")
-            }
-            OutlinedButton(onClick = { speaker.speak(s.en, rate * 0.75f) {} }, modifier = Modifier.weight(1f)) {
-                Text("천천히")
-            }
-        }
-        Button(onClick = { beginWithPermission() }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-            Text(if (phase == "scored") "다시 쉐도잉" else "쉐도잉 시작", fontSize = 18.sp)
-        }
-        OutlinedButton(onClick = { next() }, modifier = Modifier.fillMaxWidth()) {
-            Text(
-                when {
-                    idx + 1 >= sentences.size -> "결과 보기"
-                    phase == "scored" -> "다음 문장"
-                    else -> "건너뛰기"
-                }
-            )
-        }
-    }
-}
-
-@Composable
-private fun Result(
-    results: List<Int>,
-    level: Int,
-    aiReady: Boolean,
-    store: Store,
-    onLevel: (Int) -> Unit,
-    onNext: () -> Unit,
-    onHome: () -> Unit,
-) {
-    val average = remember { results.average().toInt() }
-    val before = remember { level }
-    var after by remember { mutableIntStateOf(-1) }
-    var reason by remember { mutableStateOf("") }
-    var byAi by remember { mutableStateOf(false) }
-
-    // 라운드가 끝나면 AI가 결과를 보고 다음 난이도를 정한다.
-    LaunchedEffect(Unit) {
-        var decided = Coach.ruleLevel(before, average)
-        if (aiReady) {
-            try {
-                val raw = Llm.ask(Coach.adaptPrompt(before, results, store.topWeak(5)))
-                Coach.parseLevel(raw, before)?.let {
-                    decided = if (it.second.isEmpty()) it.first to decided.second else it
-                    byAi = true
-                }
-            } catch (_: Exception) {
-            }
-        }
-        store.level = decided.first
-        store.lastReason = decided.second
-        reason = decided.second
-        after = decided.first
-        onLevel(decided.first)
-    }
-
-    BackHandler { onHome() }
-
-    Text("라운드 결과", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-    Text("평균 정확도 $average%", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = if (average >= 75) Good else Bad)
-    Text("문장별: ${results.joinToString(" · ") { "$it%" }}")
-
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (after == -1) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.width(22.dp).height(22.dp))
-                    Spacer(Modifier.width(12.dp))
-                    Text("AI가 다음 난이도를 정하고 있어요…")
-                }
-            } else {
-                Text(if (byAi) "AI의 판단" else "난이도 조절", fontWeight = FontWeight.Bold)
-                Text(
-                    when {
-                        after > before -> "레벨 $before → $after 로 올렸어요"
-                        after < before -> "레벨 $before → $after 로 내렸어요"
-                        else -> "레벨 $after 유지"
-                    },
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(reason)
-            }
-        }
-    }
-
-    if (after != -1) {
-        Button(onClick = onNext, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-            Text("다음 라운드", fontSize = 18.sp)
-        }
-        OutlinedButton(onClick = onHome, modifier = Modifier.fillMaxWidth()) { Text("홈으로") }
     }
 }

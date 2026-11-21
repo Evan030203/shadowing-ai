@@ -106,18 +106,18 @@ object Llm {
     }
 
     /** 녹음한 영어 음성(WAV)을 폰 안에서 받아쓴다. */
-    suspend fun transcribe(wav: ByteArray): String = withContext(thread) {
+    suspend fun transcribe(wav: ByteArray): String {
+        val answer = askAudio(wav, Coach.TRANSCRIBE).trim().trim('"')
+        return if (answer.uppercase().startsWith("NONE")) "" else answer
+    }
+
+    /** 소리(WAV)를 들려주고 질문한다. */
+    suspend fun askAudio(wav: ByteArray, prompt: String): String = withContext(thread) {
         val e = engine ?: throw IllegalStateException("AI 모델이 아직 준비되지 않았어요.")
         if (!hasAudio) throw IllegalStateException("이 모델은 소리를 듣지 못해요.")
-        val answer = e.createConversation().use {
-            it.sendMessage(
-                Contents.of(
-                    Content.AudioBytes(wav),
-                    Content.Text("Transcribe the English speech in this audio word for word. Output only the transcript, with no notes or quotation marks."),
-                )
-            ).toString()
+        e.createConversation().use {
+            it.sendMessage(Contents.of(Content.AudioBytes(wav), Content.Text(prompt))).toString()
         }
-        answer.trim().trim('"')
     }
 
     /** 질문 하나에 답 하나. 앞선 대화는 기억하지 않는다. */

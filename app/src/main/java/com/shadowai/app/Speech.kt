@@ -22,59 +22,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 
-/** 원어민 음성 재생(폰에 내장된 음성 합성). */
-class Speaker(ctx: Context) {
-    private val main = Handler(Looper.getMainLooper())
-    private var ready = false
-    private var onDone: (() -> Unit)? = null
-    private lateinit var tts: TextToSpeech
-
-    init {
-        tts = TextToSpeech(ctx.applicationContext) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts.language = Locale.US
-                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) = finish()
-
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) = finish()
-                })
-                ready = true
-            }
-        }
-    }
-
-    private fun finish() {
-        main.post {
-            val cb = onDone
-            onDone = null
-            cb?.invoke()
-        }
-    }
-
-    /** rate 1.0이 보통 속도. 재생이 끝나면 done을 메인 스레드에서 부른다. */
-    fun speak(text: String, rate: Float, done: () -> Unit) {
-        if (!ready) {
-            main.postDelayed({ if (ready) speak(text, rate, done) else done() }, 800)
-            return
-        }
-        onDone = done
-        tts.setSpeechRate(rate)
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "shadow")
-    }
-
-    fun stop() {
-        onDone = null
-        if (ready) tts.stop()
-    }
-
-    fun shutdown() {
-        onDone = null
-        tts.shutdown()
-    }
-}
-
 /**
  * 폰의 음성 인식으로 따라 말한 목소리를 글자로 바꾼다.
  * 폰마다 되는 인식 서비스가 달라서(코드 11 등), 실패하면 다른 서비스로 차례로 바꿔 시도하고
@@ -255,6 +202,9 @@ class Recorder {
         }
         synchronized(out) { out.reset() }
         rec = r
+        spoke = false
+        startedAt = System.currentTimeMillis()
+        lastLoud = startedAt
         running = true
         r.startRecording()
         worker = Thread {
@@ -262,7 +212,20 @@ class Recorder {
             while (running) {
                 val n = r.read(buf, 0, buf.size)
                 if (n < 0) break
-                if (n > 0) synchronized(out) { if (out.size() < MAX_BYTES) out.write(buf, 0, n) }
+                if (n > 0) {
+                    synchronized(out) { if (out.size() < MAX_BYTES) out.write(buf, 0, n) }
+                    var peak = 0
+                    var i = 0
+                    while (i + 1 < n) {
+                        val v = kotlin.math.abs((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff))
+                        if (v > peak) peak = v
+                        i += 2
+                    }
+                    if (peak > 2500) {
+                        spoke = true
+                        lastLoud = System.currentTimeMillis()
+                    }
+                }
             }
         }.also { it.start() }
         return true
@@ -290,12 +253,23 @@ class Recorder {
             b
         }
         if (pcm.size < RATE) return ByteArray(0) // 0.5초 미만
-        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-        header.put("RIFF".toByteArray()).putInt(36 + pcm.size).put("WAVE".toByteArray())
-        header.put("fmt ".toByteArray()).putInt(16).putShort(1).putShort(1)
-        header.putInt(RATE).putInt(RATE * 2).putShort(2).putShort(16)
-        header.put("data".toByteArray()).putInt(pcm.size)
-        return header.array() + pcm
+        return pcmToWav(pcm, RATE)
+    }
+
+    @Volatile
+    private var spoke = false
+
+    @Volatile
+    private var lastLoud = 0L
+
+    @Volatile
+    private var startedAt = 0L
+
+    /** 말을 시작한 뒤 1.5초쯤 조용하면(또는 25초가 지나면) 다 말한 것으로 본다. */
+    fun finishedSpeaking(): Boolean {
+        if (!running) return false
+        val now = System.currentTimeMillis()
+        return (spoke && now - lastLoud > 1500) || now - startedAt > 25_000
     }
 
     companion object {

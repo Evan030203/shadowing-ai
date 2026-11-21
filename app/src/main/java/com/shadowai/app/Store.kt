@@ -9,7 +9,7 @@ class Store(ctx: Context) {
 
     /** 1(가장 쉬움)~10(가장 어려움). 0이면 아직 고르지 않은 상태. */
     var level: Int
-        get() = p.getInt("level", 0)
+        get() = p.getInt("level", 5)
         set(v) = p.edit().putInt("level", v).apply()
 
     var topic: String
