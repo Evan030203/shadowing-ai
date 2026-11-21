@@ -43,6 +43,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -73,6 +74,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (Llm.isLoaded) KeepAlive.start(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -123,13 +129,19 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>) {
     val store = remember { Store(ctx) }
     val lib = remember { Library(ctx) }
 
-    var current by remember { mutableStateOf<VideoItem?>(null) }
+    // 다른 앱에 다녀오는 사이 시스템이 앱을 내려도, 보던 영상으로 돌아오도록 저장해 둔다.
+    var currentKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var current by remember { mutableStateOf(lib.items.firstOrNull { it.key == currentKey }) }
+    LaunchedEffect(current) { currentKey = current?.key }
     var note by remember { mutableStateOf("") }
 
     var ai by remember { mutableStateOf(AiStatus.NONE) }
     var aiNote by remember { mutableStateOf("") }
     var aiProgress by remember { mutableStateOf(0f) }
     var aiRetry by remember { mutableIntStateOf(0) }
+
+    // AI 모델이 올라와 있는 동안에는 앱이 뒤로 가도 꺼지지 않게 붙잡아 둔다.
+    LaunchedEffect(ai) { if (ai == AiStatus.READY) KeepAlive.start(ctx) }
 
     // 다른 앱에서 공유한 영상을 바로 연다.
     LaunchedEffect(shared.value) {

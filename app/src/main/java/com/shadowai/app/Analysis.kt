@@ -15,6 +15,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -335,10 +336,18 @@ object Analyzer {
 
     private var job: Job? = null
 
+    /** stop()이 불릴 때마다 올라간다. 취소된 옛 작업이 새 작업의 상태를 건드리지 않게 한다. */
+    private var gen = 0
+    private var cleanup: (() -> Unit)? = null
+
     fun stop() {
+        gen++
+        cleanup?.invoke()
+        cleanup = null
         job?.cancel()
         job = null
         running = false
+        listening = false
         note = ""
     }
 
@@ -373,6 +382,7 @@ object Analyzer {
     /** 내 파일: 소리를 직접 읽어 조각내고, 조각마다 AI가 받아쓴 뒤 난이도를 매긴다. 5분쯤 단위로 결과가 쌓인다. */
     fun analyzeFile(scope: CoroutineScope, ctx: Context, item: VideoItem, lib: Library) {
         if (running || item.done) return
+        val my = ++gen
         running = true
         note = "영상의 소리를 읽고 있어요…"
         job = scope.launch {
@@ -431,7 +441,97 @@ object Analyzer {
             } catch (e: Exception) {
                 note = "영상을 분석하지 못했어요: ${e.message ?: e.javaClass.simpleName}"
             } finally {
-                running = false
+                if (gen == my) running = false
+            }
+        }
+    }
+
+    /** 지금 영상을 재생하며 듣는 방식으로 분석 중인지. */
+    var listening by mutableStateOf(false)
+        private set
+
+    /**
+     * 유튜브: 공부를 시작하기 전에 영상을 스피커로 재생해 두고, 그 소리를 마이크로 들으며 분석한다.
+     * 영상 길이만큼 시간이 걸리고, 멈췄다가 이어서 할 수 있다.
+     */
+    fun analyzeByListening(scope: CoroutineScope, item: VideoItem, lib: Library, player: ClipPlayer, recorder: Recorder) {
+        stop()
+        val my = ++gen
+        val from = item.analyzedTo
+        val seg = Segmenter(0.0)
+        val pieces = Channel<Pair<Segmenter.Piece, Double>>(Channel.UNLIMITED)
+        val started = recorder.start { block ->
+            for (p in seg.feed(block)) {
+                // 마이크 시간과 영상 시간의 차이를 그때그때 재서 영상 위치로 바꾼다.
+                pieces.trySend(p to (player.positionSec - seg.timeSec))
+            }
+        }
+        if (!started) {
+            note = "마이크를 열 수 없어요."
+            return
+        }
+        cleanup = {
+            recorder.stop()
+            try {
+                player.stop()
+            } catch (_: Exception) {
+            }
+        }
+        running = true
+        listening = true
+        note = "영상을 재생하며 AI가 듣고 있어요…"
+        var reachedEnd = false
+        player.play(from, 1e9, 1f) {
+            reachedEnd = true
+            recorder.stop()
+            pieces.close()
+        }
+        job = scope.launch {
+            try {
+                val batch = mutableListOf<Clip>()
+
+                suspend fun flush() {
+                    if (batch.isEmpty()) return
+                    val upTo = batch.last().end
+                    val rated = rate(batch.toList())
+                    batch.clear()
+                    item.clips.addAll(rated)
+                    item.analyzedTo = upTo
+                    lib.save()
+                }
+
+                for ((p, offset) in pieces) {
+                    val text = try {
+                        Llm.transcribe(shortsToWav(p.pcm))
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    val start = (p.start + offset - 0.3).coerceAtLeast(0.0)
+                    val end = p.end + offset + 0.3
+                    if (usable(text) && end > start) batch.add(Clip(start, end, text.trim(), 0))
+                    note = "영상을 재생하며 AI가 듣고 있어요 · ${clock(player.positionSec)}" +
+                        if (player.durationSec > 0) " / ${clock(player.durationSec)}" else ""
+                    if (batch.size >= 6) flush()
+                }
+                flush()
+                if (reachedEnd) {
+                    item.done = true
+                    lib.save()
+                }
+                note = ""
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                note = "영상을 분석하지 못했어요: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                if (gen == my) {
+                    cleanup?.invoke()
+                    cleanup = null
+                    running = false
+                    listening = false
+                }
             }
         }
     }
@@ -439,6 +539,7 @@ object Analyzer {
     /** 유튜브: 붙여 넣은 스크립트를 문장 단위로 다듬고 AI가 난이도를 매겨 장면을 고른다. */
     fun analyzeScript(scope: CoroutineScope, item: VideoItem, lib: Library, lines: List<Line>, useAi: Boolean) {
         stop()
+        val my = ++gen
         running = true
         note = "AI가 스크립트를 분석하고 있어요…"
         job = scope.launch {
@@ -460,7 +561,7 @@ object Analyzer {
             } catch (e: Exception) {
                 note = "스크립트를 분석하지 못했어요: ${e.message ?: e.javaClass.simpleName}"
             } finally {
-                running = false
+                if (gen == my) running = false
             }
         }
     }

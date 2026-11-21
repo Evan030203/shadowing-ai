@@ -40,6 +40,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -103,6 +104,9 @@ fun parseScript(raw: String): List<Line> {
 interface ClipPlayer {
     val view: View
     val durationSec: Double
+
+    /** 지금 재생 중인 위치(초). */
+    val positionSec: Double
     fun play(start: Double, end: Double, rate: Float, onEnd: () -> Unit)
     fun stop()
     fun release()
@@ -119,6 +123,10 @@ class YouTubeClipPlayer(
     private val main = Handler(Looper.getMainLooper())
     private var onEnd: (() -> Unit)? = null
     override var durationSec: Double = 0.0
+        private set
+
+    @Volatile
+    override var positionSec: Double = 0.0
         private set
 
     override val view: WebView = WebView(ctx).apply {
@@ -139,6 +147,11 @@ class YouTubeClipPlayer(
                 durationSec = duration
                 if (title.isNotBlank()) onTitle(title)
             }
+        }
+
+        @JavascriptInterface
+        fun onTime(t: Double) {
+            positionSec = t
         }
 
         @JavascriptInterface
@@ -225,6 +238,7 @@ function playSeg(s, e, r) {
     }
   }, 100);
 }
+setInterval(function () { if (ready && player.getPlayerState() === 1) App.onTime(player.getCurrentTime()); }, 250);
 function stopSeg() { clearInterval(timer); pending = null; if (ready) player.pauseVideo(); }
 </script></body></html>
 """.trimIndent()
@@ -239,6 +253,13 @@ class FileClipPlayer(ctx: Context, uri: Uri, private val fail: (String) -> Unit)
     private var pending: (() -> Unit)? = null
     override var durationSec: Double = 0.0
         private set
+
+    override val positionSec: Double
+        get() = try {
+            view.currentPosition / 1000.0
+        } catch (_: Exception) {
+            0.0
+        }
 
     override val view: VideoView = VideoView(ctx).apply {
         setOnPreparedListener { m ->
@@ -330,10 +351,11 @@ fun VideoScreen(
     val canHear = aiReady && Llm.hasAudio
 
     var error by remember { mutableStateOf("") }
-    var sceneIdx by remember { mutableStateOf<Int?>(null) }
-    var clipIdx by remember { mutableIntStateOf(0) }
-    var live by remember { mutableStateOf(false) }
-    var fitFirst by remember { mutableStateOf(false) }
+    // 다른 앱에 다녀와도 보던 장면과 문장으로 돌아오도록 저장해 둔다.
+    var sceneIdx by rememberSaveable { mutableStateOf<Int?>(null) }
+    var clipIdx by rememberSaveable { mutableIntStateOf(0) }
+    var live by rememberSaveable { mutableStateOf(false) }
+    var fitFirst by rememberSaveable { mutableStateOf(false) }
     var pasted by remember { mutableStateOf("") }
     var myLevel by remember { mutableIntStateOf(store.level) }
 
@@ -553,6 +575,18 @@ fun VideoScreen(
         }
     }
 
+    fun startListeningAnalysis() {
+        resetLine()
+        Analyzer.analyzeByListening(scope, item, lib, player ?: return, recorder)
+    }
+
+    val askMicForAnalysis = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) startListeningAnalysis() else error = "마이크 권한을 허용해야 AI가 영상 소리를 들을 수 있어요."
+    }
+
+    // 분석하는 동안에는 화면이 꺼지지 않게 한다.
+    LaunchedEffect(Analyzer.running) { player?.view?.keepScreenOn = Analyzer.running }
+
     val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) play(thenListen = true) else error = "마이크 권한을 허용해야 따라 말한 걸 들을 수 있어요."
     }
@@ -655,6 +689,7 @@ fun VideoScreen(
                 val fits = s.level > 0 && abs(s.level - myLevel) <= 1
                 Card(
                     onClick = {
+                        if (Analyzer.listening) Analyzer.stop()
                         resetLine()
                         sceneIdx = i
                         clipIdx = 0
@@ -674,7 +709,7 @@ fun VideoScreen(
             }
         } else if (!Analyzer.running) {
             if (item.isYouTube) {
-                Text("유튜브는 다른 앱이 영상의 소리나 자막을 미리 읽지 못하게 막아 두어서, 미리 분석하려면 스크립트가 필요해요.")
+                Text("아직 분석하지 않은 영상이에요. 아래에서 영상을 재생하며 AI가 듣게 하거나, 스크립트를 붙여 넣어 분석해 주세요.")
             } else if (!canHear) {
                 Text("내 파일을 미리 분석하려면 홈 화면에서 AI 모델을 먼저 받아 주세요.")
             } else if (item.done) {
@@ -683,6 +718,27 @@ fun VideoScreen(
         }
 
         if (item.isYouTube) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("영상을 재생하며 미리 분석하기", fontWeight = FontWeight.Bold)
+                    if (Analyzer.listening) {
+                        Text("영상이 재생되는 동안 AI가 듣고 있어요. 폰을 조용한 곳에 두고 소리를 끄지 마세요. 멈춰도 찾은 장면은 남고, 나중에 이어서 할 수 있어요.")
+                        Button(onClick = { Analyzer.stop() }) { Text("분석 멈추기") }
+                    } else if (!canHear) {
+                        Text("홈 화면에서 AI 모델을 받으면 쓸 수 있어요.")
+                    } else if (item.done) {
+                        Text("영상을 끝까지 분석했어요.")
+                    } else {
+                        Text("공부를 시작하기 전에 영상을 스피커로 틀어 두면 AI가 들으면서 영어 대화 장면을 골라요. 이어폰은 빼고 소리를 충분히 키워 주세요. 영상 길이만큼 걸려요.")
+                        Button(
+                            onClick = { if (micGranted()) startListeningAnalysis() else askMicForAnalysis.launch(Manifest.permission.RECORD_AUDIO) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(if (item.analyzedTo > 0) "${clock(item.analyzedTo)}부터 이어서 분석하기" else "재생하며 분석 시작")
+                        }
+                    }
+                }
+            }
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(if (scenes.isEmpty()) "스크립트로 미리 분석하기" else "스크립트 다시 넣기", fontWeight = FontWeight.Bold)
@@ -699,6 +755,7 @@ fun VideoScreen(
                             error = "시간 표시(예: 0:05)가 있는 스크립트를 찾지 못했어요."
                         } else {
                             error = ""
+                            resetLine()
                             Analyzer.analyzeScript(scope, item, lib, lines, aiReady)
                         }
                     }) { Text("AI로 분석하기") }
@@ -708,6 +765,7 @@ fun VideoScreen(
 
         OutlinedButton(
             onClick = {
+                if (Analyzer.listening) Analyzer.stop()
                 resetLine()
                 live = true
                 clipIdx = 0

@@ -181,8 +181,9 @@ class Recorder {
     private var running = false
 
     @SuppressLint("MissingPermission")
-    fun start(): Boolean {
+    fun start(stream: ((ShortArray) -> Unit)? = null): Boolean {
         stop()
+        streamCb = stream
         val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (min <= 0) return false
         val r = try {
@@ -213,7 +214,15 @@ class Recorder {
                 val n = r.read(buf, 0, buf.size)
                 if (n < 0) break
                 if (n > 0) {
-                    synchronized(out) { if (out.size() < MAX_BYTES) out.write(buf, 0, n) }
+                    val cb = streamCb
+                    if (cb != null) {
+                        // 계속 듣는 모드: 모아 두지 않고 들어오는 대로 넘긴다.
+                        val shorts = ShortArray(n / 2)
+                        ByteBuffer.wrap(buf, 0, n - n % 2).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+                        cb(shorts)
+                    } else {
+                        synchronized(out) { if (out.size() < MAX_BYTES) out.write(buf, 0, n) }
+                    }
                     var peak = 0
                     var i = 0
                     while (i + 1 < n) {
@@ -239,6 +248,7 @@ class Recorder {
         } catch (_: InterruptedException) {
         }
         worker = null
+        streamCb = null
         rec?.let {
             try {
                 it.stop()
@@ -255,6 +265,9 @@ class Recorder {
         if (pcm.size < RATE) return ByteArray(0) // 0.5초 미만
         return pcmToWav(pcm, RATE)
     }
+
+    @Volatile
+    private var streamCb: ((ShortArray) -> Unit)? = null
 
     @Volatile
     private var spoke = false
