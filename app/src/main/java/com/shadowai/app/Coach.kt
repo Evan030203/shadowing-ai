@@ -2,30 +2,25 @@ package com.shadowai.app
 
 /** 로컬 AI에게 시키는 일들의 지시문과, 그 답을 읽는 방법. */
 object Coach {
-    fun levelName(level: Int): String = when {
-        level <= 0 -> "분석 전"
-        level <= 3 -> "쉬움"
-        level <= 6 -> "보통"
-        else -> "어려움"
-    }
-
     const val TRANSCRIBE =
         "Transcribe the English speech in this audio word for word. Output only the transcript, with no notes or quotation marks. " +
             "If there is no clear English speech (only music, noise, singing or another language), output exactly NONE."
 
-    /** 영상 대사들의 난이도를 매기게 한다. 0은 공부에 쓸 수 없다는 뜻. */
-    fun ratePrompt(lines: List<String>): String = buildString {
-        appendLine("You grade lines from a video for a Korean learner who practises English shadowing.")
-        appendLine("For each numbered line give a difficulty from 1 (very easy) to 10 (very hard), judging vocabulary, sentence length and how natural speech would sound.")
-        appendLine("Give 0 when the line is not usable for shadowing: not English, song lyrics, noise, or a meaningless fragment.")
-        appendLine("Reply with one line per item in the form number: score and nothing else.")
+    /** 영상에서 받아쓴 줄들 가운데 공부할 가치가 있는 영어만 고르게 한다. */
+    fun keepPrompt(lines: List<String>): String = buildString {
+        appendLine("You pick lines from a video transcript for a Korean learner who practises English shadowing.")
+        appendLine("For each numbered line answer KEEP or DROP.")
+        appendLine("KEEP: a meaningful English sentence or phrase that a person actually says and that is worth repeating aloud.")
+        appendLine("DROP: anything that is not English, song lyrics, sound descriptions such as [Music], lines that are only names or single words, filler such as \"uh\" or \"okay okay\", and broken fragments that make no sense.")
+        appendLine("Reply with one line per item in the form number: KEEP or number: DROP and nothing else.")
         lines.forEachIndexed { i, t -> appendLine("${i + 1}. $t") }
     }
 
-    fun parseScores(raw: String): Map<Int, Int> {
-        val out = mutableMapOf<Int, Int>()
-        for (m in Regex("(?m)^\\D{0,3}(\\d{1,2})\\s*[:.)\\-]\\s*(\\d{1,2})\\b").findAll(raw)) {
-            out[m.groupValues[1].toInt()] = m.groupValues[2].toInt()
+    /** 줄 번호 -> 남길지(true) 버릴지(false). 답에 없는 번호는 들어 있지 않다. */
+    fun parseKeep(raw: String): Map<Int, Boolean> {
+        val out = mutableMapOf<Int, Boolean>()
+        for (m in Regex("(?mi)^\\D{0,3}(\\d{1,2})\\s*[:.)\\-]\\s*\\**\\s*(KEEP|DROP)").findAll(raw)) {
+            out[m.groupValues[1].toInt()] = m.groupValues[2].uppercase() == "KEEP"
         }
         return out
     }

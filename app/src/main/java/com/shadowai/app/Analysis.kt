@@ -28,18 +28,13 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.sqrt
 
-/** 따라 말할 한 문장: 영상의 어느 구간인지, 무슨 말인지, 얼마나 어려운지(1~10, 0은 아직 모름). */
-data class Clip(val start: Double, val end: Double, val text: String, val level: Int)
+/** 따라 말할 한 문장: 영상의 어느 구간인지, 무슨 말인지. */
+data class Clip(val start: Double, val end: Double, val text: String)
 
 /** 이어지는 문장들을 묶은 한 장면. */
 class Scene(val clips: List<Clip>) {
     val start: Double get() = clips.first().start
     val end: Double get() = clips.last().end
-    val level: Int
-        get() {
-            val rated = clips.filter { it.level > 0 }
-            return if (rated.isEmpty()) 0 else rated.sumOf { it.level } / rated.size
-        }
 }
 
 /** 말이 끊기지 않고 이어지는 문장끼리 한 장면으로 묶는다. 한 장면은 1분을 넘지 않게 한다. */
@@ -83,7 +78,7 @@ class Library(ctx: Context) {
                     val cs = o.optJSONArray("clips") ?: JSONArray()
                     for (j in 0 until cs.length()) {
                         val c = cs.getJSONObject(j)
-                        item.clips.add(Clip(c.getDouble("s"), c.getDouble("e"), c.getString("t"), c.optInt("l", 0)))
+                        item.clips.add(Clip(c.getDouble("s"), c.getDouble("e"), c.getString("t")))
                     }
                     items.add(item)
                 }
@@ -98,7 +93,7 @@ class Library(ctx: Context) {
             for (item in items) {
                 val cs = JSONArray()
                 for (c in item.clips) {
-                    cs.put(JSONObject().put("s", c.start).put("e", c.end).put("t", c.text).put("l", c.level))
+                    cs.put(JSONObject().put("s", c.start).put("e", c.end).put("t", c.text))
                 }
                 arr.put(
                     JSONObject().put("key", item.key).put("title", item.title).put("kind", item.kind)
@@ -359,22 +354,21 @@ object Analyzer {
         return words >= 3 && letters * 2 >= t.length
     }
 
-    /** 문장마다 난이도를 매기고, 쓸 수 없는 것(영어가 아님, 노래, 의미 없는 조각)은 뺀다. */
-    suspend fun rate(clips: List<Clip>): List<Clip> {
-        if (clips.isEmpty()) return clips
+    /** 공부에 쓸 만한 영어 문장만 남긴다. 영어가 아닌 것, 노래, 의미 없는 조각은 버린다. */
+    suspend fun keepUseful(clips: List<Clip>): List<Clip> {
+        val english = clips.filter { usable(it.text) }
+        if (english.isEmpty() || !Llm.isLoaded) return english
         val out = mutableListOf<Clip>()
-        for (group in clips.chunked(15)) {
-            val scores = try {
-                Coach.parseScores(Llm.ask(Coach.ratePrompt(group.map { it.text })))
+        for (group in english.chunked(15)) {
+            val verdicts = try {
+                Coach.parseKeep(Llm.ask(Coach.keepPrompt(group.map { it.text })))
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 emptyMap()
             }
-            group.forEachIndexed { i, c ->
-                val s = scores[i + 1]
-                if (s == null) out.add(c.copy(level = 5)) else if (s > 0) out.add(c.copy(level = s.coerceIn(1, 10)))
-            }
+            // AI의 답을 읽지 못한 문장은 남긴다. 이미 영어인지는 위에서 한 번 걸렀다.
+            group.forEachIndexed { i, c -> if (verdicts[i + 1] != false) out.add(c) }
         }
         return out
     }
@@ -395,7 +389,7 @@ object Analyzer {
                         var lastNote = -10.0
 
                         suspend fun flush(upTo: Double) {
-                            val rated = rate(batch)
+                            val rated = keepUseful(batch.toList())
                             batch.clear()
                             withContext(Dispatchers.Main) {
                                 item.clips.addAll(rated)
@@ -416,7 +410,7 @@ object Analyzer {
                                 } catch (_: Exception) {
                                     ""
                                 }
-                                if (usable(text)) batch.add(Clip(piece.start, piece.end, text.trim(), 0))
+                                if (usable(text)) batch.add(Clip(piece.start, piece.end, text.trim()))
                                 if (batch.size >= 8) flush(piece.end)
                             }
                             if (abs(seg.timeSec - lastNote) >= 5) {
@@ -493,7 +487,7 @@ object Analyzer {
                 suspend fun flush() {
                     if (batch.isEmpty()) return
                     val upTo = batch.last().end
-                    val rated = rate(batch.toList())
+                    val rated = keepUseful(batch.toList())
                     batch.clear()
                     item.clips.addAll(rated)
                     item.analyzedTo = upTo
@@ -510,7 +504,7 @@ object Analyzer {
                     }
                     val start = (p.start + offset - 0.3).coerceAtLeast(0.0)
                     val end = p.end + offset + 0.3
-                    if (usable(text) && end > start) batch.add(Clip(start, end, text.trim(), 0))
+                    if (usable(text) && end > start) batch.add(Clip(start, end, text.trim()))
                     note = "영상을 재생하며 AI가 듣고 있어요 · ${clock(player.positionSec)}" +
                         if (player.durationSec > 0) " / ${clock(player.durationSec)}" else ""
                     if (batch.size >= 6) flush()
@@ -544,11 +538,11 @@ object Analyzer {
         note = "AI가 스크립트를 분석하고 있어요…"
         job = scope.launch {
             try {
-                val merged = mergeLines(lines).map { Clip(it.start, it.end, it.text, 0) }
+                val merged = mergeLines(lines).map { Clip(it.start, it.end, it.text) }
                 item.clips.clear()
                 item.done = false
                 for (group in merged.chunked(15)) {
-                    val rated = if (useAi) rate(group) else group
+                    val rated = keepUseful(group)
                     item.clips.addAll(rated)
                     item.analyzedTo = group.last().end
                     note = "AI가 스크립트를 분석하고 있어요 · ${clock(group.last().end)}"

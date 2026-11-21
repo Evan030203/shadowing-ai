@@ -233,7 +233,6 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
                 VideoScreen(
                     item = item,
                     lib = lib,
-                    store = store,
                     aiReady = ai == AiStatus.READY,
                     hear = hear,
                     recorder = recorder,
@@ -293,7 +292,7 @@ private fun Home(
     }
 
     Text("쉐도잉 AI", fontSize = 30.sp, fontWeight = FontWeight.Bold)
-    Text("좋아하는 영상을 넣으면 AI가 영어 대화 장면을 골라 주고, 따라 말한 내 발음을 분석해요.")
+    Text("영상을 넣으면 AI가 영어가 나오는 부분만 골라 주고, 따라 말한 내 발음을 분석해요.")
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

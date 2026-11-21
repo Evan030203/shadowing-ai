@@ -488,7 +488,6 @@ private val Bad = Color(0xFFD23B3B)
 fun VideoScreen(
     item: VideoItem,
     lib: Library,
-    store: Store,
     aiReady: Boolean,
     hear: Hear,
     recorder: Recorder,
@@ -504,9 +503,8 @@ fun VideoScreen(
     var sceneIdx by rememberSaveable { mutableStateOf<Int?>(null) }
     var clipIdx by rememberSaveable { mutableIntStateOf(0) }
     var live by rememberSaveable { mutableStateOf(false) }
-    var fitFirst by rememberSaveable { mutableStateOf(false) }
+    var showScript by remember { mutableStateOf(false) }
     var pasted by remember { mutableStateOf("") }
-    var myLevel by remember { mutableIntStateOf(store.level) }
 
     // 학습 중 상태
     var phase by remember { mutableStateOf("idle") } // idle, playing, listening, analyzing, done
@@ -548,7 +546,7 @@ fun VideoScreen(
     }
 
     val scenes = remember(item.clips.toList()) { groupScenes(item.clips.toList()) }
-    val liveClips = remember { List(1200) { Clip(it * 6.0, it * 6.0 + 6.0, "", 0) } }
+    val liveClips = remember { List(1200) { Clip(it * 6.0, it * 6.0 + 6.0, "") } }
     val studying = live || sceneIdx != null
     val cur: List<Clip> = when {
         live -> liveClips
@@ -580,16 +578,6 @@ fun VideoScreen(
         error = ""
     }
 
-    /** 채점 결과를 기록하고, 문장 난이도와 정확도를 보고 내 수준을 조금씩 조절한다. */
-    fun record(sc: Score, c: Clip) {
-        store.record(sc)
-        if (c.level > 0) {
-            if (sc.accuracy >= 90 && c.level >= myLevel) myLevel = (myLevel + 1).coerceAtMost(10)
-            if (sc.accuracy < 60 && c.level <= myLevel) myLevel = (myLevel - 1).coerceAtLeast(1)
-            store.level = myLevel
-        }
-    }
-
     /** 녹음을 끝내고 AI가 내 말을 받아쓴 뒤, 녹음을 직접 듣고 발음을 봐 준다. */
     fun finishRecording() {
         val c = clip ?: return
@@ -618,7 +606,6 @@ fun VideoScreen(
             val target = c.text.ifBlank { aiRef[clipIdx].orEmpty() }
             if (target.isBlank()) return@launch
             val sc = scoreShadow(target, text)
-            record(sc, c)
             feedback = "…"
             val answer = try {
                 Llm.askAudio(wav, Coach.pronunciationPrompt(target, text, sc.missed)).replace("*", "").trim()
@@ -647,7 +634,6 @@ fun VideoScreen(
                 val target = c.text.ifBlank { aiRef[clipIdx].orEmpty() }
                 if (target.isNotBlank()) {
                     val sc = scoreShadow(target, text)
-                    record(sc, c)
                     if (aiReady && sc.missed.isNotEmpty()) {
                         feedback = "…"
                         scope.launch {
@@ -769,8 +755,14 @@ fun VideoScreen(
             if (phase == "playing" || phase == "listening") resetLine() else player?.stop()
         }
     }
+    // 영상을 열면 바로 분석을 시작한다. 유튜브는 한 번도 분석하지 않은 영상만 자동으로 재생하며 듣는다.
     LaunchedEffect(item.key, canHear) {
-        if (!item.isYouTube && canHear && !item.done) Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib)
+        if (!canHear || item.done || studying) return@LaunchedEffect
+        if (!item.isYouTube) {
+            Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib)
+        } else if (player != null && item.clips.isEmpty() && item.analyzedTo == 0.0 && !Analyzer.running) {
+            if (micGranted()) startListeningAnalysis() else askMicForAnalysis.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     BackHandler {
@@ -818,37 +810,57 @@ fun VideoScreen(
     if (error.isNotEmpty()) Text(error, color = Bad)
 
     if (!studying) {
-        // ───── 장면 목록 ─────
-        if (Analyzer.running || Analyzer.note.isNotEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(Analyzer.note.ifEmpty { "분석 중이에요…" }, fontWeight = FontWeight.Bold)
-                    if (Analyzer.running) Text("찾은 장면부터 바로 연습할 수 있어요. 연습하는 동안에는 분석을 잠시 멈춰요.")
+        // ───── 분석 상태와 장면 목록 ─────
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                when {
+                    Analyzer.listening -> {
+                        Text(Analyzer.note.ifEmpty { "영상을 재생하며 AI가 듣고 있어요…" }, fontWeight = FontWeight.Bold)
+                        Text("이어폰은 빼고 소리를 충분히 키워 주세요. 영상 길이만큼 걸리고, 찾은 장면부터 바로 연습할 수 있어요.")
+                        OutlinedButton(onClick = { Analyzer.stop() }) { Text("분석 멈추기") }
+                    }
+                    Analyzer.running -> {
+                        Text(Analyzer.note.ifEmpty { "AI가 영상을 분석하고 있어요…" }, fontWeight = FontWeight.Bold)
+                        Text("찾은 장면부터 바로 연습할 수 있어요. 연습하는 동안에는 분석을 잠시 멈춰요.")
+                    }
+                    item.done -> Text(
+                        if (scenes.isEmpty()) "이 영상에서는 공부할 만한 영어를 찾지 못했어요."
+                        else "분석을 마쳤어요. 영어가 아닌 부분은 뺐어요.",
+                        fontWeight = FontWeight.Bold,
+                    )
+                    !canHear -> Text(
+                        if (aiReady) "이 폰에서는 AI가 소리를 듣지 못해서 영상을 직접 분석할 수 없어요."
+                        else "홈 화면에서 AI 모델을 먼저 받아 주세요. 모델이 있어야 영상을 분석할 수 있어요."
+                    )
+                    item.isYouTube -> {
+                        Text(
+                            if (item.analyzedTo > 0) "${clock(item.analyzedTo)}까지 분석했어요." else "아직 분석하지 않았어요.",
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text("영상을 스피커로 재생하면 AI가 들으면서 영어가 나오는 부분만 골라요.")
+                        Button(
+                            onClick = { if (micGranted()) startListeningAnalysis() else askMicForAnalysis.launch(Manifest.permission.RECORD_AUDIO) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(if (item.analyzedTo > 0) "이어서 분석하기" else "재생하며 분석 시작") }
+                    }
+                    else -> {
+                        Text(
+                            if (item.analyzedTo > 0) "${clock(item.analyzedTo)}까지 분석했어요." else "분석을 준비하고 있어요…",
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Button(
+                            onClick = { Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("분석 이어서 하기") }
+                    }
                 }
+                if (!Analyzer.running && Analyzer.note.isNotEmpty()) Text(Analyzer.note, color = Bad)
             }
         }
 
         if (scenes.isNotEmpty()) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    "영어 대화 장면 ${scenes.size}개 · 내 수준 $myLevel/10",
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            FilterChip(
-                selected = fitFirst,
-                onClick = { fitFirst = !fitFirst },
-                label = { Text("내 수준에 맞는 장면 먼저") },
-            )
-            val order = if (fitFirst) {
-                scenes.indices.sortedBy { if (scenes[it].level == 0) 99 else abs(scenes[it].level - myLevel) }
-            } else {
-                scenes.indices.toList()
-            }
-            for (i in order) {
-                val s = scenes[i]
-                val fits = s.level > 0 && abs(s.level - myLevel) <= 1
+            Text("쉐도잉할 장면 ${scenes.size}개", fontWeight = FontWeight.Bold)
+            scenes.forEachIndexed { i, s ->
                 Card(
                     onClick = {
                         if (Analyzer.listening) Analyzer.stop()
@@ -859,90 +871,59 @@ fun VideoScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            "${clock(s.start)} ~ ${clock(s.end)} · ${s.clips.size}문장 · ${Coach.levelName(s.level)}" +
-                                (if (fits) " · 추천" else ""),
-                            fontWeight = FontWeight.Bold,
-                            color = if (fits) Good else Color.Unspecified,
-                        )
+                        Text("${clock(s.start)} ~ ${clock(s.end)} · ${s.clips.size}문장", fontWeight = FontWeight.Bold)
                         Text(s.clips.joinToString(" ") { it.text }, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }
-        } else if (!Analyzer.running) {
-            if (item.isYouTube) {
-                Text("아직 분석하지 않은 영상이에요. 아래에서 영상을 재생하며 AI가 듣게 하거나, 스크립트를 붙여 넣어 분석해 주세요.")
-            } else if (!canHear) {
-                Text("내 파일을 미리 분석하려면 홈 화면에서 AI 모델을 먼저 받아 주세요.")
-            } else if (item.done) {
-                Text("이 영상에서는 따라 말할 영어 대사를 찾지 못했어요.")
-            }
         }
 
         if (item.isYouTube) {
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("영상을 재생하며 미리 분석하기", fontWeight = FontWeight.Bold)
-                    if (Analyzer.listening) {
-                        Text("영상이 재생되는 동안 AI가 듣고 있어요. 폰을 조용한 곳에 두고 소리를 끄지 마세요. 멈춰도 찾은 장면은 남고, 나중에 이어서 할 수 있어요.")
-                        Button(onClick = { Analyzer.stop() }) { Text("분석 멈추기") }
-                    } else if (!canHear) {
-                        Text("홈 화면에서 AI 모델을 받으면 쓸 수 있어요.")
-                    } else if (item.done) {
-                        Text("영상을 끝까지 분석했어요.")
-                    } else {
-                        Text("공부를 시작하기 전에 영상을 스피커로 틀어 두면 AI가 들으면서 영어 대화 장면을 골라요. 이어폰은 빼고 소리를 충분히 키워 주세요. 영상 길이만큼 걸려요.")
-                        Button(
-                            onClick = { if (micGranted()) startListeningAnalysis() else askMicForAnalysis.launch(Manifest.permission.RECORD_AUDIO) },
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text(if (item.analyzedTo > 0) "${clock(item.analyzedTo)}부터 이어서 분석하기" else "재생하며 분석 시작")
-                        }
+            TextButton(onClick = { showScript = !showScript }) { Text("스크립트가 있으면 붙여 넣어 더 빨리 분석하기") }
+            if (showScript) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("유튜브에서 영상 설명란 → '스크립트 표시'의 내용을 복사해 붙여 넣으면, 재생하지 않고 바로 분석해요.")
+                        OutlinedTextField(
+                            value = pasted,
+                            onValueChange = { pasted = it },
+                            modifier = Modifier.fillMaxWidth().height(130.dp),
+                            label = { Text("스크립트 (0:05 같은 시간 표시 포함)") },
+                        )
+                        Button(onClick = {
+                            val lines = parseScript(pasted)
+                            if (lines.isEmpty()) {
+                                error = "시간 표시(예: 0:05)가 있는 스크립트를 찾지 못했어요."
+                            } else {
+                                error = ""
+                                showScript = false
+                                resetLine()
+                                Analyzer.analyzeScript(scope, item, lib, lines, aiReady)
+                            }
+                        }) { Text("스크립트로 분석하기") }
                     }
-                }
-            }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(if (scenes.isEmpty()) "스크립트로 미리 분석하기" else "스크립트 다시 넣기", fontWeight = FontWeight.Bold)
-                    Text("유튜브에서 영상 설명란 → '스크립트 표시'의 내용을 복사해 붙여 넣으면, AI가 공부하기 좋은 장면을 골라 줘요.")
-                    OutlinedTextField(
-                        value = pasted,
-                        onValueChange = { pasted = it },
-                        modifier = Modifier.fillMaxWidth().height(130.dp),
-                        label = { Text("스크립트 (0:05 같은 시간 표시 포함)") },
-                    )
-                    Button(onClick = {
-                        val lines = parseScript(pasted)
-                        if (lines.isEmpty()) {
-                            error = "시간 표시(예: 0:05)가 있는 스크립트를 찾지 못했어요."
-                        } else {
-                            error = ""
-                            resetLine()
-                            Analyzer.analyzeScript(scope, item, lib, lines, aiReady)
-                        }
-                    }) { Text("AI로 분석하기") }
                 }
             }
         }
 
-        OutlinedButton(
-            onClick = {
-                if (Analyzer.listening) Analyzer.stop()
-                resetLine()
-                live = true
-                clipIdx = 0
-            },
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("분석 없이 처음부터 6초씩 연습하기") }
-        if (canHear) Text("분석 없이 연습할 때는 구간을 스피커로 재생하면 AI가 그 소리를 듣고 받아써요.")
+        // AI가 소리를 듣지 못하는 폰에서만 남겨 두는 대안.
+        if (!canHear) {
+            OutlinedButton(
+                onClick = {
+                    resetLine()
+                    live = true
+                    clipIdx = 0
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("분석 없이 처음부터 6초씩 연습하기") }
+        }
         return
     }
 
     // ───── 쉐도잉 ─────
     val c = clip ?: return
     Text(
-        (if (live) "구간 ${clock(c.start)} ~ ${clock(c.end)}" else "문장 ${clipIdx + 1} / ${cur.size} · ${clock(c.start)}") +
-            (if (c.level > 0) " · 난이도 ${c.level}/10" else ""),
+        if (live) "구간 ${clock(c.start)} ~ ${clock(c.end)}" else "문장 ${clipIdx + 1} / ${cur.size} · ${clock(c.start)}",
         fontWeight = FontWeight.Bold,
     )
 
