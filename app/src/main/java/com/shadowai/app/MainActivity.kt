@@ -62,6 +62,14 @@ class MainActivity : ComponentActivity() {
     /** 다른 앱의 공유 버튼으로 넘어온 것: 유튜브 주소(글) 또는 영상 파일. */
     private val shared = mutableStateOf<Any?>(null)
 
+    /** 앱이 화면에서 사라질 때마다 올라간다. 재생과 듣기를 멈추는 신호로 쓴다. */
+    private val stops = mutableIntStateOf(0)
+
+    override fun onStop() {
+        stops.intValue++
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -70,7 +78,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 Surface(Modifier.fillMaxSize()) {
-                    App(hear, recorder, shared)
+                    App(hear, recorder, shared, stops.intValue)
                 }
             }
         }
@@ -124,7 +132,7 @@ private fun openFile(ctx: Context, lib: Library, uri: Uri): VideoItem {
 }
 
 @Composable
-fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>) {
+fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: Int) {
     val ctx = LocalContext.current
     val store = remember { Store(ctx) }
     val lib = remember { Library(ctx) }
@@ -229,6 +237,7 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>) {
                     aiReady = ai == AiStatus.READY,
                     hear = hear,
                     recorder = recorder,
+                    stopSignal = stopSignal,
                     onExit = { current = null },
                 )
             }

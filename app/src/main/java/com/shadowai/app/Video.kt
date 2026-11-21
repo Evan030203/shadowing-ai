@@ -12,14 +12,20 @@ import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebView
-import android.widget.VideoView
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
+import android.view.Surface
+import android.view.TextureView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -107,6 +113,9 @@ interface ClipPlayer {
 
     /** 지금 재생 중인 위치(초). */
     val positionSec: Double
+
+    /** 멈춘 상태에서 그 위치의 장면을 화면에 보여 준다(지원하는 재생기만). */
+    fun show(sec: Double) {}
     fun play(start: Double, end: Double, rate: Float, onEnd: () -> Unit)
     fun stop()
     fun release()
@@ -169,6 +178,8 @@ class YouTubeClipPlayer(
                 onEnd = null
                 fail(
                     when (code) {
+                        -1 -> "유튜브 플레이어를 불러오지 못했어요. 인터넷 연결을 확인해 주세요."
+                        -3 -> "영상을 불러오는 데 오래 걸리고 있어요. 인터넷 연결을 확인해 주세요."
                         100 -> "영상을 찾을 수 없어요. 삭제됐거나 비공개일 수 있어요."
                         101, 150, 153 -> "이 영상은 올린 사람이 다른 앱에서 재생하지 못하게 막아 두었어요. 다른 영상을 골라 주세요."
                         else -> "영상을 재생할 수 없어요 (유튜브 오류 $code)."
@@ -200,13 +211,16 @@ class YouTubeClipPlayer(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="strict-origin-when-cross-origin">
-<style>html,body{margin:0;height:100%;background:#000}#p{width:100%;height:100%}</style>
-</head><body><div id="p"></div>
+<style>html,body{margin:0;height:100%;background:#000}#p{position:absolute;left:0;top:0;width:100%;height:100%}
+#msg{position:absolute;left:0;top:44%;width:100%;text-align:center;color:#bbb;font:14px sans-serif}</style>
+</head><body><div id="msg">영상을 불러오는 중…</div><div id="p"></div>
 <script>
 var player, endAt = -1, timer = null, ready = false, pending = null, began = 0;
 var tag = document.createElement('script');
 tag.src = "https://www.youtube.com/iframe_api";
+tag.onerror = function () { App.onError(-1); };
 document.head.appendChild(tag);
+setTimeout(function () { if (!ready) App.onError(-3); }, 20000);
 function onYouTubeIframeAPIReady() {
   player = new YT.Player('p', {
     width: '100%', height: '100%', videoId: 'VIDEO_ID',
@@ -245,71 +259,197 @@ function stopSeg() { clearInterval(timer); pending = null; if (ready) player.pau
     }
 }
 
-/** 폰에 있는 내 영상·음성 파일을 화면과 함께 구간별로 재생한다. 인터넷이 필요 없다. */
-class FileClipPlayer(ctx: Context, uri: Uri, private val fail: (String) -> Unit) : ClipPlayer {
+/**
+ * 폰에 있는 내 영상·음성 파일을 화면과 함께 구간별로 재생한다. 인터넷이 필요 없다.
+ * 스크롤되는 화면 안에서는 SurfaceView(VideoView)가 검게만 나오는 일이 있어, 일반 뷰처럼 그려지는 TextureView를 쓴다.
+ */
+class FileClipPlayer(ctx: Context, private val uri: Uri, private val fail: (String) -> Unit) : ClipPlayer {
+    private val appCtx = ctx.applicationContext
     private val main = Handler(Looper.getMainLooper())
     private var mp: MediaPlayer? = null
+    private var surface: Surface? = null
+    private var prepared = false
+    private var seeking = false
+    private var completed = false
     private var tick: Runnable? = null
     private var pending: (() -> Unit)? = null
+    private var videoW = 0
+    private var videoH = 0
+
+    /** 마지막으로 보여 준 위치. 화면이 다시 만들어지면 여기를 다시 보여 준다. */
+    private var lastSec = 2.0
+
     override var durationSec: Double = 0.0
         private set
 
     override val positionSec: Double
         get() = try {
-            view.currentPosition / 1000.0
+            if (prepared) (mp?.currentPosition ?: 0) / 1000.0 else 0.0
         } catch (_: Exception) {
             0.0
         }
 
-    override val view: VideoView = VideoView(ctx).apply {
-        setOnPreparedListener { m ->
+    override val view: TextureView = TextureView(ctx).apply {
+        isOpaque = false
+        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                open(Surface(texture))
+            }
+
+            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+                fit()
+            }
+
+            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                close()
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
+        }
+    }
+
+    /** 영상의 가로세로 비율을 지켜 화면 가운데에 맞춘다. */
+    private fun fit() {
+        val vw = view.width.toFloat()
+        val vh = view.height.toFloat()
+        if (videoW <= 0 || videoH <= 0 || vw <= 0f || vh <= 0f) return
+        val scale = minOf(vw / videoW, vh / videoH)
+        val matrix = Matrix()
+        matrix.setScale(videoW * scale / vw, videoH * scale / vh, vw / 2f, vh / 2f)
+        view.setTransform(matrix)
+    }
+
+    private fun open(s: Surface) {
+        close()
+        surface = s
+        try {
+            val m = MediaPlayer()
             mp = m
-            durationSec = m.duration / 1000.0
-            val p = pending
-            pending = null
-            if (p != null) p() else seekTo(1)
+            m.setSurface(s)
+            m.setOnVideoSizeChangedListener { _, w, h ->
+                videoW = w
+                videoH = h
+                fit()
+            }
+            m.setOnSeekCompleteListener { seeking = false }
+            m.setOnCompletionListener { completed = true }
+            m.setOnPreparedListener {
+                if (mp === m) {
+                    prepared = true
+                    durationSec = m.duration / 1000.0
+                    val p = pending
+                    pending = null
+                    if (p != null) p() else show(lastSec)
+                }
+            }
+            m.setOnErrorListener { _, _, _ ->
+                prepared = false
+                fail("이 파일은 재생할 수 없어요. 다른 영상이나 음성 파일을 골라 주세요.")
+                true
+            }
+            m.setDataSource(appCtx, uri)
+            m.prepareAsync()
+        } catch (_: Exception) {
+            fail("이 파일을 열 수 없어요. 다른 영상이나 음성 파일을 골라 주세요.")
         }
-        setOnErrorListener { _, _, _ ->
-            mp = null
-            fail("이 파일은 재생할 수 없어요. 다른 영상이나 음성 파일을 골라 주세요.")
-            true
+    }
+
+    /** 화면이 사라질 때(다른 앱으로 갈 때 포함) 재생기를 정리한다. 돌아오면 open()이 다시 불린다. */
+    private fun close() {
+        val interrupted = tick != null
+        prepared = false
+        tick?.let { main.removeCallbacks(it) }
+        tick = null
+        try {
+            mp?.release()
+        } catch (_: Exception) {
         }
-        setVideoURI(uri)
+        mp = null
+        surface?.release()
+        surface = null
+        // 재생 도중에 끊겼으면 화면이 '듣는 중'에 멈춰 있지 않게 알린다.
+        if (interrupted) fail("")
+    }
+
+    /** 멈춘 상태에서 그 위치의 장면을 보여 준다. 소리 없이 잠깐 재생했다 멈춰야 그림이 나온다. */
+    override fun show(sec: Double) {
+        lastSec = sec
+        val m = mp ?: return
+        if (!prepared || tick != null) return
+        try {
+            m.setVolume(0f, 0f)
+            seeking = true
+            m.seekTo((sec * 1000).toLong(), MediaPlayer.SEEK_CLOSEST)
+            m.start()
+            main.postDelayed({
+                try {
+                    if (mp === m && tick == null) {
+                        m.pause()
+                        m.setVolume(1f, 1f)
+                    }
+                } catch (_: Exception) {
+                }
+            }, 300)
+        } catch (_: Exception) {
+        }
     }
 
     override fun play(start: Double, end: Double, rate: Float, onEnd: () -> Unit) {
         stop()
+        lastSec = start
         val m = mp
-        if (m == null) {
+        if (m == null || !prepared) {
             pending = { play(start, end, rate, onEnd) }
             return
         }
         try {
+            m.setVolume(1f, 1f)
+            seeking = true
+            completed = false
             m.seekTo((start * 1000).toLong(), MediaPlayer.SEEK_CLOSEST)
-            view.start()
+            m.start()
             m.playbackParams = m.playbackParams.setSpeed(rate)
         } catch (_: Exception) {
-            try {
-                view.seekTo((start * 1000).toInt())
-                view.start()
-            } catch (_: Exception) {
-            }
+            fail("이 구간을 재생하지 못했어요.")
+            return
         }
         val began = System.currentTimeMillis()
         val r = object : Runnable {
             override fun run() {
-                val stalled = !view.isPlaying && System.currentTimeMillis() - began > 2000
-                if (view.currentPosition >= end * 1000 || stalled) {
-                    if (view.isPlaying) view.pause()
+                if (mp !== m) {
+                    tick = null
+                    return
+                }
+                val waited = System.currentTimeMillis() - began
+                val playing = try {
+                    m.isPlaying
+                } catch (_: Exception) {
+                    false
+                }
+                val pos = try {
+                    m.currentPosition
+                } catch (_: Exception) {
+                    Int.MAX_VALUE
+                }
+                // 위치 이동이 끝나기 전에는 예전 위치가 읽히므로, 이동이 끝난 뒤에만 끝 지점을 본다.
+                val moved = !seeking || waited > 3000
+                val reached = moved && pos >= end * 1000
+                val stalled = !playing && waited > 3000
+                if (reached || completed || stalled) {
+                    try {
+                        if (playing) m.pause()
+                    } catch (_: Exception) {
+                    }
                     tick = null
                     onEnd()
                 } else {
-                    main.postDelayed(this, 80)
+                    main.postDelayed(this, 60)
                 }
             }
         }
         tick = r
-        main.postDelayed(r, 300)
+        main.postDelayed(r, 200)
     }
 
     override fun stop() {
@@ -317,18 +457,15 @@ class FileClipPlayer(ctx: Context, uri: Uri, private val fail: (String) -> Unit)
         tick?.let { main.removeCallbacks(it) }
         tick = null
         try {
-            if (view.isPlaying) view.pause()
+            val m = mp
+            if (m != null && prepared && m.isPlaying) m.pause()
         } catch (_: Exception) {
         }
     }
 
     override fun release() {
         stop()
-        mp = null
-        try {
-            view.stopPlayback()
-        } catch (_: Exception) {
-        }
+        close()
     }
 }
 
@@ -344,6 +481,7 @@ fun VideoScreen(
     aiReady: Boolean,
     hear: Hear,
     recorder: Recorder,
+    stopSignal: Int,
     onExit: () -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -606,6 +744,20 @@ fun VideoScreen(
 
     // 공부를 시작하기 전에 영상을 미리 분석한다. 공부하는 동안에는 멈춰 둔다.
     LaunchedEffect(studying) { Analyzer.paused = studying }
+
+    // 문장을 옮기면 그 문장이 나오는 장면을 미리 보여 준다.
+    LaunchedEffect(sceneIdx, clipIdx, live) {
+        val shown = clip
+        if (shown != null && phase == "idle") player?.show(shown.start)
+    }
+
+    // 다른 앱으로 가면 재생과 듣기를 멈춘다. 마이크는 앱이 화면에 있을 때만 쓸 수 있다.
+    LaunchedEffect(stopSignal) {
+        if (stopSignal > 0) {
+            if (Analyzer.listening) Analyzer.stop()
+            if (phase == "playing" || phase == "listening") resetLine() else player?.stop()
+        }
+    }
     LaunchedEffect(item.key, canHear) {
         if (!item.isYouTube && canHear && !item.done) Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib)
     }
@@ -648,10 +800,9 @@ fun VideoScreen(
         return
     }
 
-    AndroidView(
-        factory = { player.view },
-        modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f),
-    )
+    Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(Color.Black)) {
+        AndroidView(factory = { player.view }, modifier = Modifier.fillMaxSize())
+    }
 
     if (error.isNotEmpty()) Text(error, color = Bad)
 
