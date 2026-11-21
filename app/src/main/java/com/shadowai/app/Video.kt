@@ -16,6 +16,7 @@ import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.view.Surface
 import android.view.TextureView
+import android.view.ViewGroup
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -143,6 +144,12 @@ class YouTubeClipPlayer(
         settings.domStorageEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
         webChromeClient = WebChromeClient()
+        // 웹뷰는 높이 설정이 '내용에 맞춤'이면 페이지에 화면 높이를 0으로 알려 준다.
+        // 그러면 플레이어 높이가 0이 되어 소리만 나고 화면은 검게 보이므로, 반드시 '부모에 맞춤'으로 둔다.
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
         setBackgroundColor(android.graphics.Color.BLACK)
         addJavascriptInterface(Bridge(), "App")
         // 유튜브 임베드는 요청한 쪽의 주소(Referer)가 있어야 재생된다.
@@ -211,8 +218,8 @@ class YouTubeClipPlayer(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="strict-origin-when-cross-origin">
-<style>html,body{margin:0;height:100%;background:#000}#p{position:absolute;left:0;top:0;width:100%;height:100%}
-#msg{position:absolute;left:0;top:44%;width:100%;text-align:center;color:#bbb;font:14px sans-serif}</style>
+<style>html,body{margin:0;height:100%;background:#000}#p{position:absolute;left:0;top:0;width:100vw;height:56.25vw}
+#msg{position:absolute;left:0;top:calc(28vw - 10px);width:100%;text-align:center;color:#bbb;font:14px sans-serif}</style>
 </head><body><div id="msg">영상을 불러오는 중…</div><div id="p"></div>
 <script>
 var player, endAt = -1, timer = null, ready = false, pending = null, began = 0;
@@ -290,6 +297,10 @@ class FileClipPlayer(ctx: Context, private val uri: Uri, private val fail: (Stri
         }
 
     override val view: TextureView = TextureView(ctx).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
         isOpaque = false
         surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
