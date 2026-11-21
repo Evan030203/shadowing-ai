@@ -53,16 +53,26 @@ fun groupScenes(clips: List<Clip>): List<Scene> {
 }
 
 /** 사용자가 넣은 영상 하나와 그 분석 결과. */
-class VideoItem(val key: String, title: String, val kind: String, val src: String) {
+class VideoItem(val key: String, title: String, val kind: String, src: String) {
     var title by mutableStateOf(title)
+
+    /** 영상이 있는 곳. 주소로 넣은 영상 파일은 폰에 저장한 뒤 폰 안의 파일 주소로 바뀐다. */
+    var src by mutableStateOf(src)
+
+    /** 폰에 저장하는 중이면 그 다운로드 번호, 아니면 -1. */
+    var downloadId = -1L
     val clips = mutableStateListOf<Clip>()
     var analyzedTo by mutableDoubleStateOf(0.0)
     var done by mutableStateOf(false)
     val isYouTube: Boolean get() = kind == "yt"
+
+    /** 인터넷 주소로 넣은 영상 파일이라 아직 폰에 저장해야 하는지. */
+    val needsSaving: Boolean get() = !isYouTube && (src.startsWith("http://") || src.startsWith("https://"))
 }
 
 /** 넣었던 영상 목록과 분석 결과를 폰에 저장해 두어, 다시 열 때 분석을 반복하지 않는다. */
 class Library(ctx: Context) {
+    private val appCtx = ctx.applicationContext
     private val file = File(ctx.filesDir, "library.json")
     val items = mutableStateListOf<VideoItem>()
 
@@ -75,6 +85,7 @@ class Library(ctx: Context) {
                     val item = VideoItem(o.getString("key"), o.getString("title"), o.getString("kind"), o.getString("src"))
                     item.analyzedTo = o.optDouble("to", 0.0)
                     item.done = o.optBoolean("done", false)
+                    item.downloadId = o.optLong("dl", -1L)
                     val cs = o.optJSONArray("clips") ?: JSONArray()
                     for (j in 0 until cs.length()) {
                         val c = cs.getJSONObject(j)
@@ -97,7 +108,7 @@ class Library(ctx: Context) {
                 }
                 arr.put(
                     JSONObject().put("key", item.key).put("title", item.title).put("kind", item.kind)
-                        .put("src", item.src).put("to", item.analyzedTo).put("done", item.done).put("clips", cs)
+                        .put("src", item.src).put("to", item.analyzedTo).put("done", item.done).put("dl", item.downloadId).put("clips", cs)
                 )
             }
             file.writeText(arr.toString())
@@ -116,6 +127,14 @@ class Library(ctx: Context) {
     }
 
     fun remove(item: VideoItem) {
+        // 폰에 저장해 둔 영상 파일과 진행 중인 저장도 함께 지운다.
+        if (item.downloadId != -1L) {
+            try {
+                ModelFiles.cancel(appCtx, item.downloadId)
+            } catch (_: Exception) {
+            }
+        }
+        if (!item.isYouTube) Saved.delete(appCtx, item)
         items.remove(item)
         save()
     }

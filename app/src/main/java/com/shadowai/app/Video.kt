@@ -41,6 +41,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -517,9 +518,14 @@ fun VideoScreen(
     var attempt by remember { mutableIntStateOf(0) }
     val aiRef = remember { mutableStateMapOf<Int, String>() }
 
-    val player: ClipPlayer? = remember(item.key) {
+    // 유튜브 영상은 인터넷이 있어야 재생된다. 인터넷이 없으면 분석해 둔 문장을 영상 없이 연습한다.
+    var noVideo by rememberSaveable { mutableStateOf(item.isYouTube && !isOnline(ctx)) }
+
+    val player: ClipPlayer? = remember(item.key, item.src, noVideo) {
         try {
-            if (item.isYouTube) {
+            if (noVideo) {
+                TextClipPlayer(ctx) { at -> item.clips.firstOrNull { abs(it.start - at) < 0.01 }?.text.orEmpty() }
+            } else if (item.isYouTube) {
                 YouTubeClipPlayer(
                     ctx,
                     item.src,
@@ -532,6 +538,11 @@ fun VideoScreen(
                     fail = {
                         error = it
                         phase = "idle"
+                        // 인터넷이 끊겨 영상을 못 불러왔으면, 분석해 둔 문장을 영상 없이 연습하게 한다.
+                        if (!isOnline(ctx) && item.clips.isNotEmpty()) {
+                            if (Analyzer.listening) Analyzer.stop()
+                            noVideo = true
+                        }
                     },
                 )
             } else {
@@ -756,8 +767,8 @@ fun VideoScreen(
         }
     }
     // 영상을 열면 바로 분석을 시작한다. 유튜브는 한 번도 분석하지 않은 영상만 자동으로 재생하며 듣는다.
-    LaunchedEffect(item.key, canHear) {
-        if (!canHear || item.done || studying) return@LaunchedEffect
+    LaunchedEffect(item.key, canHear, noVideo) {
+        if (!canHear || item.done || studying || noVideo) return@LaunchedEffect
         if (!item.isYouTube) {
             Analyzer.analyzeFile(scope, ctx.applicationContext, item, lib)
         } else if (player != null && item.clips.isEmpty() && item.analyzedTo == 0.0 && !Analyzer.running) {
@@ -777,9 +788,10 @@ fun VideoScreen(
             Analyzer.paused = false
             hear.cancel()
             recorder.stop()
-            player?.release()
         }
     }
+    // 재생기가 바뀌면(영상 없이 연습으로 바꿀 때 등) 예전 재생기를 정리한다.
+    DisposableEffect(player) { onDispose { player?.release() } }
 
     Row {
         Text(
@@ -804,7 +816,7 @@ fun VideoScreen(
     }
 
     Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(Color.Black)) {
-        AndroidView(factory = { player.view }, modifier = Modifier.fillMaxSize())
+        key(player) { AndroidView(factory = { player.view }, modifier = Modifier.fillMaxSize()) }
     }
 
     if (error.isNotEmpty()) Text(error, color = Bad)
@@ -814,6 +826,18 @@ fun VideoScreen(
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 when {
+                    noVideo -> {
+                        Text("영상 없이 문장만 연습하는 중이에요", fontWeight = FontWeight.Bold)
+                        Text("유튜브 영상은 인터넷이 있어야 재생돼요. 분석해 둔 문장은 폰의 합성 음성으로 들으며 인터넷 없이 연습할 수 있어요.")
+                        OutlinedButton(onClick = {
+                            if (isOnline(ctx)) {
+                                resetLine()
+                                noVideo = false
+                            } else {
+                                error = "아직 인터넷에 연결되어 있지 않아요."
+                            }
+                        }) { Text("영상으로 돌아가기") }
+                    }
                     Analyzer.listening -> {
                         Text(Analyzer.note.ifEmpty { "영상을 재생하며 AI가 듣고 있어요…" }, fontWeight = FontWeight.Bold)
                         Text("이어폰은 빼고 소리를 충분히 키워 주세요. 영상 길이만큼 걸리고, 찾은 장면부터 바로 연습할 수 있어요.")
@@ -860,6 +884,13 @@ fun VideoScreen(
 
         if (scenes.isNotEmpty()) {
             Text("쉐도잉할 장면 ${scenes.size}개", fontWeight = FontWeight.Bold)
+            if (item.isYouTube && !noVideo) {
+                TextButton(onClick = {
+                    if (Analyzer.listening) Analyzer.stop()
+                    resetLine()
+                    noVideo = true
+                }) { Text("영상 없이 문장만 연습하기 (인터넷 없이 가능)") }
+            }
             scenes.forEachIndexed { i, s ->
                 Card(
                     onClick = {
@@ -907,7 +938,7 @@ fun VideoScreen(
         }
 
         // AI가 소리를 듣지 못하는 폰에서만 남겨 두는 대안.
-        if (!canHear) {
+        if (!canHear && !noVideo) {
             OutlinedButton(
                 onClick = {
                     resetLine()

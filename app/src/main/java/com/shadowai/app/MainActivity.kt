@@ -230,15 +230,20 @@ fun App(hear: Hear, recorder: Recorder, shared: MutableState<Any?>, stopSignal: 
         val item = current
         if (item != null) {
             key(item.key) {
-                VideoScreen(
-                    item = item,
-                    lib = lib,
-                    aiReady = ai == AiStatus.READY,
-                    hear = hear,
-                    recorder = recorder,
-                    stopSignal = stopSignal,
-                    onExit = { current = null },
-                )
+                if (item.needsSaving) {
+                    // 주소로 넣은 영상 파일은 먼저 폰에 저장한다. 다 받으면 아래 영상 화면으로 넘어간다.
+                    SaveScreen(item = item, lib = lib, onExit = { current = null })
+                } else {
+                    VideoScreen(
+                        item = item,
+                        lib = lib,
+                        aiReady = ai == AiStatus.READY,
+                        hear = hear,
+                        recorder = recorder,
+                        stopSignal = stopSignal,
+                        onExit = { current = null },
+                    )
+                }
             }
         } else {
             Home(
@@ -363,6 +368,7 @@ private fun Home(
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("주소로 열기") }
+            Text("영상 파일 주소(mp4 등)는 폰에 저장해서 인터넷 없이 연습해요. 유튜브 영상은 저장되지 않아요.")
             Text("유튜브 앱이나 갤러리의 공유 버튼에서 '쉐도잉 AI'를 골라도 돼요.")
         }
     }
